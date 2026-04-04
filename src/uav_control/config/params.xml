@@ -1,0 +1,35 @@
+/**:
+  ros__parameters:
+    # ── Offboard Control ────────────────────────────────────────────────
+    offboard_control:
+      takeoff_height: -2.0      # m (NED: âm = lên cao)
+      cruise_speed: 2.0          # m/s
+      position_threshold: 0.25   # m (sai số chấp nhận)
+      loop_rate_hz: 20.0         # Hz
+      yaw_rate_dps: 30.0         # deg/s
+
+    # ── Telemetry Monitor ────────────────────────────────────────────────
+    telemetry_monitor:
+      battery_warn_pct: 25.0     # %
+      battery_crit_pct: 15.0     # %
+      max_altitude_m: 50.0       # m AGL
+      max_speed_ms: 10.0         # m/s
+      publish_rate_hz: 2.0       # Hz
+
+    # ── Hardware ─────────────────────────────────────────────────────────
+    hardware:
+      serial_port: /dev/ttyAMA0  # UART0 trên RPi4 → Pixhawk TELEM2
+      baud_rate: 921600
+      # Sơ đồ kết nối UART:
+      #   RPi4 GPIO14 (TXD) → Pixhawk TELEM2 RX
+      #   RPi4 GPIO15 (RXD) → Pixhawk TELEM2 TX
+      #   RPi4 GND          → Pixhawk GND
+      # Lưu ý: disable serial login shell trước:
+      #   sudo raspi-config → Interface Options → Serial Port
+      #   → Login shell: No, Serial hardware: Yes
+
+    # ── Safety ───────────────────────────────────────────────────────────
+    safety:
+      geofence_radius_m: 100.0   # m từ home point
+      rtl_on_failsafe: true
+      min_satellites: 6          # GPS fix tối thiểu

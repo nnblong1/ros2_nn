@@ -1,0 +1,91 @@
+arm_dynamics_node:
+  ros__parameters:
+    dh_a:
+    - 0.0
+    - 0.0
+    - 0.155
+    - 0.034
+    - 0.0
+    - 0.0
+    dh_alpha:
+    - 0.0
+    - 1.5708
+    - 0.0
+    - 0.0
+    - 1.5708
+    - -1.5708
+    dh_d:
+    - 0.034
+    - 0.0
+    - 0.0
+    - 0.043
+    - 0.075
+    - 0.035
+    link_lengths:
+    - 0.049
+    - 0.155
+    - 0.034
+    - 0.043
+    - 0.075
+    - 0.035
+    link_masses:
+    - 0.1432
+    - 0.0742
+    - 0.1122
+    - 0.0298
+    - 0.0448
+    - 0.0149
+lstm_predictive_node:
+  ros__parameters:
+    enable_filter: true
+    scale_factor: 1.0
+    seq_len: 10
+uam_adaptive_controller:
+  ros__parameters:
+    Ixx: 0.03957
+    Iyy: 0.04752
+    Izz: 0.03055
+    alt_Kd: 2.5
+    alt_Ki: 1.0
+    alt_Kp: 8.0
+    alt_cz: 0.1
+    alt_sigma_m: 0.08
+    base_pitch_offset: -0.08
+    base_roll_offset: 0.0
+    gravity: 9.81
+    lx: 0.1589
+    ly: 0.1589
+    mass_nominal: 2.35
+    max_thrust: 71.6
+    max_torque: 5.0
+    pitch_Kd: 15.0
+    pitch_Ki: 1.0
+    pitch_Kp: 25.0
+    psi_des: 0.0
+    rbfnn_enable: true
+    rbfnn_eta: 0.02
+    rbfnn_lr: 0.01
+    rbfnn_neurons: 25
+    rbfnn_width: 1.5
+    roll_Kd: 15.0
+    roll_Ki: 1.0
+    roll_Kp: 25.0
+    x_des: 0.0
+    y_des: 0.0
+    yaw_Kd: 1.0
+    yaw_Ki: 0.05
+    yaw_Kp: 1.5
+    z_des: 2.0
+uam_mission_bridge:
+  ros__parameters:
+    cruise_speed: 2.0
+    loop_rate_hz: 20.0
+    position_threshold: 0.25
+    takeoff_height: 2.0
+uam_telemetry_monitor:
+  ros__parameters:
+    battery_crit_pct: 15.0
+    battery_warn_pct: 25.0
+    m_hat_warn_deviation: 1.2
+    max_altitude_m: 50.0
+    max_speed_ms: 10.0
