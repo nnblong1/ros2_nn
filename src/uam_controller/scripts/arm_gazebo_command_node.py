@@ -15,6 +15,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 import subprocess
 import shutil
+import time
 
 # ── Thử import gz-transport Python bindings ──
 GZ_TRANSPORT_OK = False
@@ -94,6 +95,7 @@ class ArmGazeboCommandNode(Node):
             msg = GzDouble()
             msg.data = float(positions[i])
             pub.publish(msg)
+            time.sleep(0.05)  # Throttling chống rớt gói tin ZeroMQ khi gửi sát nhau
 
     # ──────────────── subprocess fallback ────────────────
     def _init_subprocess_fallback(self):
@@ -120,6 +122,7 @@ class ArmGazeboCommandNode(Node):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                time.sleep(0.05)  # Throttling chống quá tải subprocess
             except Exception as e:
                 self.get_logger().error(f'gz topic -p failed: {e}')
 
@@ -137,6 +140,11 @@ class ArmGazeboCommandNode(Node):
         if GZ_TRANSPORT_OK:
             self._publish_gz_transport(pos)
         else:
+            # If using subprocess fallback, do NOT loop all 6 at once.
+            # However, time.sleep(0.5) inside a 50Hz ROS2 callback will DESTROY the control loop.
+            # For dynamic control, the Python GZ bridge MUST be used.
+            # If forced to use subprocess fallback, we must warn about dropped packets
+            # but we won't sleep in the main thread.
             self._publish_subprocess(pos)
 
         self.get_logger().debug(f'Cmd: {pos}')

@@ -7,6 +7,7 @@ import csv
 import time
 import math
 import os
+import sys
 
 class RBFNNDataLogger(Node):
     def __init__(self):
@@ -65,6 +66,22 @@ class RBFNNDataLogger(Node):
 
     def timer_cb(self):
         t = time.time() - self.start_time
+        
+        # Giám sát Rớt / Bay quá cao / Nghiêng quá mức (Nới lỏng theo yêu cầu người dùng)
+        if t > 20.0:
+            # Cho phép drone nghiêng tới 80 độ mới coi là lật (rất lỏng)
+            if abs(self.roll) > 80.0 or abs(self.pitch) > 80.0:
+                self.get_logger().error(f"💥 PHÁT HIỆN LẬT: Roll={self.roll:.1f}, Pitch={self.pitch:.1f}")
+                self.csv_file.close()
+                os._exit(1)
+            
+            # Cho phép độ cao từ -0.5m đến 10m (tránh lỗi trôi EKF trên mặt đất)
+            if self.enu_z < -0.5 or self.enu_z > 10.0:
+                self.get_logger().error(f"💥 PHÁT HIỆN RỚT/VỌT: Độ cao={self.enu_z:.2f}m")
+                self.csv_file.close()
+                os._exit(1)
+
+                
         self.csv_writer.writerow([
             f"{t:.3f}", f"{self.enu_z:.3f}", f"{self.roll:.3f}", f"{self.pitch:.3f}",
             f"{self.m_hat:.3f}", f"{self.n0[0]:.4f}", f"{self.n0[1]:.4f}", f"{self.n0[2]:.4f}"

@@ -49,7 +49,7 @@ class UAMTelemetryMonitor(Node):
         )
 
         # ── Subscribers ──
-        self.create_subscription(VehicleStatus, "/fmu/out/vehicle_status", self._cb_status, qos)
+        self.create_subscription(VehicleStatus, "/fmu/out/vehicle_status_v1", self._cb_status, qos)
         self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self._cb_local, qos)
         self.create_subscription(BatteryStatus, "/fmu/out/battery_status", self._cb_battery, qos)
         self.create_subscription(VehicleGlobalPosition, "/fmu/out/vehicle_global_position", self._cb_global, qos)

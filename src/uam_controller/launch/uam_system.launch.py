@@ -70,17 +70,8 @@ def generate_launch_description():
         description='Đường dẫn file YAML chứa toàn bộ tham số hệ thống'
     )
 
-    arg_model = DeclareLaunchArgument(
-        'model_path',
-        default_value=PathJoinSubstitution(
-            [pkg_share, 'models', 'lstm_uam_weights.pth']
-        ),
-        description='Đường dẫn file trọng số LSTM (.pth)'
-    )
-
     sim         = LaunchConfiguration('sim')
     config_file = LaunchConfiguration('config_file')
-    model_path  = LaunchConfiguration('model_path')
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 0 – Micro XRCE-DDS Agent
@@ -120,26 +111,11 @@ def generate_launch_description():
             ('/fmu/in/vehicle_torque_setpoint',  '/fmu/in/vehicle_torque_setpoint'),
             ('/fmu/in/vehicle_thrust_setpoint',  '/fmu/in/vehicle_thrust_setpoint'),
             ('/fmu/out/vehicle_odometry',        '/fmu/out/vehicle_odometry'),
-            ('/fmu/out/vehicle_status',          '/fmu/out/vehicle_status'),
+            ('/fmu/out/vehicle_status',          '/fmu/out/vehicle_status_v1'),
         ],
         additional_env={'ROS_DOMAIN_ID': '0'}
     )
 
-    # ═══════════════════════════════════════════════════════════
-    #  NODE 2 – LSTM Predictive Feedforward  (Python, 20 Hz)
-    #  [BỎ QUA LSTM THEO YÊU CẦU NGƯỜI DÙNG]
-    # ═══════════════════════════════════════════════════════════
-
-    # lstm_node = Node(
-    #     package='uam_controller',
-    #     executable='lstm_feedforward_node.py',
-    #     name='lstm_predictive_node',
-    #     output='screen',
-    #     parameters=[
-    #         config_file,                    # seq_len, scale_factor, enable_filter
-    #         {'model_path': model_path},     # ngoại lệ: đường dẫn phụ thuộc máy
-    #     ]
-    # )
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 3 – Arm Dynamics Newton-Euler  (Python, 50 Hz)
@@ -161,7 +137,6 @@ def generate_launch_description():
     #  t=0s   DDS Agent khởi động
     #  t=2s   Backstepping node bắt đầu (chờ DDS ổn định)
     #  t=2.5s Arm Dynamics node bắt đầu
-    #  t=3s   LSTM node bắt đầu (cần Backstepping đã chạy trước)
     # ═══════════════════════════════════════════════════════════
 
     # ═══════════════════════════════════════════════════════════
@@ -173,6 +148,19 @@ def generate_launch_description():
         package='uam_controller',
         executable='arm_gazebo_command_node.py',
         name='arm_gazebo_command_node',
+        output='screen',
+        condition=IfCondition(sim)
+    )
+
+    # ═══════════════════════════════════════════════════════════
+    #  NODE 4.5 – Arm Initial Pose (run once then exit)
+    #  Gửi góc ban đầu cho cánh tay để co vào trước khi takeoff
+    # ═══════════════════════════════════════════════════════════
+
+    arm_initial_pose_proc = Node(
+        package='uam_controller',
+        executable='arm_initial_pose.py',
+        name='arm_initial_pose',
         output='screen',
         condition=IfCondition(sim)
     )
@@ -204,19 +192,21 @@ def generate_launch_description():
         output='screen'
     )
 
-    delayed_mission      = TimerAction(period=1.5,   actions=[mission_bridge_node])
+    delayed_arm_cmd      = TimerAction(period=1.0,   actions=[arm_cmd_node])
+    delayed_arm_pose     = TimerAction(period=2.0,   actions=[arm_initial_pose_proc])  # t=2s: script tự chờ 3s nữa → joint đầu tiên lúc t≈5s
     delayed_backstepping = TimerAction(period=2.0,   actions=[backstepping_node])
     delayed_arm_dynamics = TimerAction(period=2.5,   actions=[arm_dynamics_node])
-    # delayed_lstm         = TimerAction(period=3.0,   actions=[lstm_node])
-    delayed_arm_cmd      = TimerAction(period=3.5,   actions=[arm_cmd_node])
     delayed_telemetry    = TimerAction(period=3.5,   actions=[telemetry_node])
     delayed_logger       = TimerAction(period=4.0,   actions=[data_logger_node])
+
+    # 🚨 QUAN TRỌNG: Cất cánh SAU KHI tay đã gập xong
+    # arm_initial_pose: t=2s start + 3s startup + 6×2s joints = t≈17s done
+    delayed_mission      = TimerAction(period=20.0,   actions=[mission_bridge_node])
 
     return LaunchDescription([
         # Arguments
         arg_sim,
         arg_config,
-        arg_model,
         # DDS bridge (khởi động ngay)
         xrce_hardware,
         xrce_sim,
@@ -224,8 +214,8 @@ def generate_launch_description():
         delayed_mission,
         delayed_backstepping,
         delayed_arm_dynamics,
-        # delayed_lstm,
         delayed_arm_cmd,
+        delayed_arm_pose,    # Gửi tư thế co tay sau 5s
         delayed_telemetry,
         delayed_logger,
     ])

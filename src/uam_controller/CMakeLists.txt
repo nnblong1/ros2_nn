@@ -50,15 +50,14 @@ ament_python_install_package(${PROJECT_NAME})
 
 # ── Python scripts ──
 install(PROGRAMS
-  scripts/lstm_feedforward_node.py
   scripts/arm_dynamics_node.py
-  scripts/train_lstm_offline.py
   scripts/arm_gazebo_command_node.py
-  scripts/arm_trajectory_generator.py
   scripts/uam_mission_bridge.py
   scripts/uam_telemetry_monitor.py
-  scripts/rbfnn_training_supervisor.py
   scripts/rbfnn_data_logger.py
+  scripts/rbfnn_training_supervisor.py
+  scripts/arm_trajectory_generator.py
+  scripts/arm_initial_pose.py
   
   DESTINATION lib/${PROJECT_NAME}
 )
