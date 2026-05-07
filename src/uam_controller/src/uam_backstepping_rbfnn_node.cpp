@@ -49,7 +49,6 @@ UAMAdaptiveController::UAMAdaptiveController() : Node("uam_adaptive_controller")
     // RBFNN phải khởi tạo SAU declare_params() để nhận đúng learning_rate từ YAML
     rbfnn_ = std::make_unique<RBFNeuralNetwork>(rbfnn_params_);
 
-    auto qos_r = rclcpp::QoS(10).reliable();
     auto qos_be = rclcpp::SensorDataQoS();
 
     torque_pub_ = create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/in/vehicle_torque_setpoint", qos_be);
@@ -63,6 +62,9 @@ UAMAdaptiveController::UAMAdaptiveController() : Node("uam_adaptive_controller")
     rates_sp_sub_ = create_subscription<px4_msgs::msg::VehicleRatesSetpoint>(
         "/fmu/out/vehicle_rates_setpoint", qos_be, std::bind(&UAMAdaptiveController::rates_sp_cb, this, std::placeholders::_1));
 
+    land_sub_ = create_subscription<px4_msgs::msg::VehicleLandDetected>(
+        "/fmu/out/vehicle_land_detected", qos_be, std::bind(&UAMAdaptiveController::land_cb, this, std::placeholders::_1));
+
     joint_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         "/joint_states", 10, std::bind(&UAMAdaptiveController::joint_cb, this, std::placeholders::_1));
         
@@ -71,9 +73,6 @@ UAMAdaptiveController::UAMAdaptiveController() : Node("uam_adaptive_controller")
         
     enable_sub_ = create_subscription<std_msgs::msg::Bool>(
         "/uam/controller_enable", 10, std::bind(&UAMAdaptiveController::enable_cb, this, std::placeholders::_1));
-
-    state_sub_ = create_subscription<std_msgs::msg::String>(
-        "/uam/state", qos_r, std::bind(&UAMAdaptiveController::state_cb, this, std::placeholders::_1));
 
     timer_ = create_wall_timer(5ms, std::bind(&UAMAdaptiveController::control_loop, this));
 
@@ -140,6 +139,9 @@ void UAMAdaptiveController::odom_cb(const px4_msgs::msg::VehicleOdometry::Shared
     omega_(0) = msg->angular_velocity[0]; // Roll speed rad/s
     omega_(1) = msg->angular_velocity[1]; // Pitch speed 
     omega_(2) = msg->angular_velocity[2]; // Yaw speed
+    altitude_m_ = -msg->position[2];
+    vertical_speed_m_s_ = -msg->velocity[2];
+    last_odom_rx_time_ = get_clock()->now().seconds();
     has_odom_ = true;
 }
 
@@ -155,7 +157,13 @@ void UAMAdaptiveController::rates_sp_cb(const px4_msgs::msg::VehicleRatesSetpoin
     thrust_des_(1) = msg->thrust_body[1];
     thrust_des_(2) = msg->thrust_body[2];
     
+    last_rates_sp_rx_time_ = get_clock()->now().seconds();
     has_rates_sp_ = true;
+}
+
+void UAMAdaptiveController::land_cb(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg) {
+    landed_ = msg->landed;
+    ground_contact_ = msg->ground_contact;
 }
 
 void UAMAdaptiveController::joint_cb(const sensor_msgs::msg::JointState::SharedPtr msg) {
@@ -181,25 +189,33 @@ void UAMAdaptiveController::enable_cb(const std_msgs::msg::Bool::SharedPtr msg) 
         rbfnn_->reset();
         controller_start_time_ = -1.0; // Reset ramp timer cho flight session mới
         e_omega_int_.setZero();        // Reset integral
+        e_omega_prev_.setZero();
+        e_omega_dot_prev_.setZero();
+        n_hat_.setZero();
+    } else if (!msg->data && controller_enabled_) {
+        RCLCPP_INFO(get_logger(), "Rate Controller DISABLED. PX4 internal rate controller fallback remains active.");
+        rbfnn_->reset();
+        controller_start_time_ = -1.0;
+        e_omega_int_.setZero();
+        e_omega_prev_.setZero();
+        e_omega_dot_prev_.setZero();
+        n_hat_.setZero();
     }
     controller_enabled_ = msg->data;
 }
 
-void UAMAdaptiveController::state_cb(const std_msgs::msg::String::SharedPtr msg) {
-    // Simple JSON parsing to get mission_state
-    std::string data = msg->data;
-    std::string old_state = mission_state_;
+bool UAMAdaptiveController::inputs_fresh(double now) const {
+    const bool odom_fresh = has_odom_ && last_odom_rx_time_ > 0.0 && (now - last_odom_rx_time_) < 0.1;
+    const bool rates_sp_fresh = has_rates_sp_ && last_rates_sp_rx_time_ > 0.0 && (now - last_rates_sp_rx_time_) < 0.1;
+    return odom_fresh && rates_sp_fresh;
+}
 
-    if (data.find("\"TAKEOFF\"") != std::string::npos) mission_state_ = "TAKEOFF";
-    else if (data.find("\"HOLD\"") != std::string::npos)    mission_state_ = "HOLD";
-    else if (data.find("\"GOTO\"") != std::string::npos)    mission_state_ = "GOTO";
-    else if (data.find("\"IDLE\"") != std::string::npos)    mission_state_ = "IDLE";
-    else if (data.find("\"ARMED\"") != std::string::npos)   mission_state_ = "ARMED";
-    else mission_state_ = "OTHER";
-
-    if (mission_state_ != old_state) {
-        RCLCPP_INFO(get_logger(), "Mission State changed: %s -> %s", old_state.c_str(), mission_state_.c_str());
-    }
+bool UAMAdaptiveController::in_takeoff_sensitive_phase(double elapsed_since_enable) const {
+    return landed_
+        || ground_contact_
+        || altitude_m_ < 1.8
+        || std::abs(vertical_speed_m_s_) > 0.35
+        || elapsed_since_enable < RAMP_PHASE2_END;
 }
 
 double UAMAdaptiveController::sat(double v, double lim) const {
@@ -210,26 +226,25 @@ double UAMAdaptiveController::sat(double v, double lim) const {
 // VÒNG LẶP ĐIỀU KHIỂN CHÍNH
 // ════════════════════════════════════════════════════════════════
 void UAMAdaptiveController::control_loop() {
-    bool can_compute = (has_odom_ && has_rates_sp_ && controller_enabled_);
-
     double now = get_clock()->now().seconds();
     double dt  = (last_t_ > 0.0) ? (now - last_t_) : 0.005;
     dt = std::clamp(dt, 0.001, 0.02);
     last_t_ = now;
+    const bool can_compute = controller_enabled_ && inputs_fresh(now);
 
     Eigen::Vector3d tau_norm = Eigen::Vector3d::Zero();
     Eigen::Vector3d thrust_norm = Eigen::Vector3d::Zero();
     Eigen::Vector3d tau = Eigen::Vector3d::Zero();
+    bool takeoff_sensitive = true;
 
     if (can_compute) {
-        bool is_takeoff_or_idle = (mission_state_ == "TAKEOFF" || mission_state_ == "ARMED" || mission_state_ == "IDLE");
-
         // ★ Ghi nhận thời điểm controller bắt đầu hoạt động
         if (controller_start_time_ < 0.0) {
             controller_start_time_ = now;
             RCLCPP_INFO(get_logger(), "⏱️ Controller start time recorded. RBFNN Ramp-up begins.");
         }
         double elapsed = now - controller_start_time_;
+        takeoff_sensitive = in_takeoff_sensitive_phase(elapsed);
 
         // 1. Tính toán Sai số (Error) LUÔN CHẠY
         e_omega_ = omega_ - omega_des_;
@@ -273,7 +288,7 @@ void UAMAdaptiveController::control_loop() {
         Eigen::Matrix3d Kd_mat = Eigen::Vector3d(rate_gains_.Kd_roll, rate_gains_.Kd_pitch, rate_gains_.Kd_yaw).asDiagonal();
 
         // Integral — LUÔN tích lũy, clamp chặt hơn khi takeoff
-        double int_clamp = is_takeoff_or_idle ? 0.2 : 0.5;
+        double int_clamp = takeoff_sensitive ? 0.2 : 0.5;
         e_omega_int_ += e_omega_ * dt;
         e_omega_int_ = e_omega_int_.cwiseMax(-int_clamp).cwiseMin(int_clamp);
 
@@ -297,37 +312,43 @@ void UAMAdaptiveController::control_loop() {
         thrust_norm(1) = std::clamp(thrust_des_(1), -0.1, 0.1);
         thrust_norm(2) = std::clamp(thrust_des_(2), -1.0, -0.05);
     } else {
+        if (controller_enabled_) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                2000,
+                "External rate controller enabled but PX4 inputs are stale. "
+                "Holding ROS torque/thrust publish; PX4 internal fallback should stay active.");
+        }
         n_hat_.setZero();
         // Không nhận đủ điều kiện tính toán -> Lực = 0 để nuôi Control Allocator
     }
     
-    // 4. LUÔN LUÔN Gửi ngược Lực đẩy (Thrust) và Mô-men (Torque) về cho PX4
-    // Để giữ "mạng sống" cho Control Allocator
+    // 4. Chỉ gửi lực đẩy và mô-men về cho PX4 khi controller_enabled_ = true
+    // Khi controller_enabled_ = false, KHÔNG GỬI để PX4 tự động fallback về internal rate controller
     if (px4_timestamp_ == 0) return; 
 
-    // Approach B: Giữ position=True ở Mission Bridge để PX4 vẫn chạy Position/Attitude Controller
-    // và sinh ra VehicleRatesSetpoint. PX4 Rate Controller gains = 0 nên không xung đột.
-    // QUAN TRỌNG: Nếu dùng direct_actuator=true, PX4 sẽ không sinh RateSetpoint → hỏng!
+    if (controller_enabled_ && can_compute) {
+        px4_msgs::msg::VehicleTorqueSetpoint torque_msg{};
+        torque_msg.xyz[0] = static_cast<float>(sat(tau_norm(0), 1.0));
+        torque_msg.xyz[1] = static_cast<float>(sat(tau_norm(1), 1.0));
+        torque_msg.xyz[2] = static_cast<float>(sat(tau_norm(2), 1.0));
+        torque_msg.timestamp = px4_timestamp_;
+        torque_msg.timestamp_sample = px4_timestamp_;
+        torque_pub_->publish(torque_msg);
 
-    px4_msgs::msg::VehicleTorqueSetpoint torque_msg{};
-    torque_msg.xyz[0] = static_cast<float>(sat(tau_norm(0), 1.0));
-    torque_msg.xyz[1] = static_cast<float>(sat(tau_norm(1), 1.0));
-    torque_msg.xyz[2] = static_cast<float>(sat(tau_norm(2), 1.0));
-    torque_msg.timestamp = px4_timestamp_;
-    torque_msg.timestamp_sample = px4_timestamp_;
-    torque_pub_->publish(torque_msg);
-
-    px4_msgs::msg::VehicleThrustSetpoint thrust_msg{};
-    thrust_msg.xyz[0] = static_cast<float>(thrust_norm(0));
-    thrust_msg.xyz[1] = static_cast<float>(thrust_norm(1));
-    thrust_msg.xyz[2] = static_cast<float>(thrust_norm(2));
-    thrust_msg.timestamp = px4_timestamp_;
-    thrust_msg.timestamp_sample = px4_timestamp_;
-    thrust_pub_->publish(thrust_msg);
+        px4_msgs::msg::VehicleThrustSetpoint thrust_msg{};
+        thrust_msg.xyz[0] = static_cast<float>(thrust_norm(0));
+        thrust_msg.xyz[1] = static_cast<float>(thrust_norm(1));
+        thrust_msg.xyz[2] = static_cast<float>(thrust_norm(2));
+        thrust_msg.timestamp = px4_timestamp_;
+        thrust_msg.timestamp_sample = px4_timestamp_;
+        thrust_pub_->publish(thrust_msg);
+    }
 
     // 5. Cấp lệnh cho cánh tay máy (Đã tách biệt để hoạt động ngay khi controller_enabled)
     if (controller_enabled_ && has_joints_) {
-        Eigen::VectorXd tau_j = compute_joint_control();
+        Eigen::VectorXd tau_j = compute_joint_control(takeoff_sensitive);
         std_msgs::msg::Float64MultiArray joint_msg;
         for (int i = 0; i < N_JOINTS; ++i) joint_msg.data.push_back(tau_j(i));
         joint_tau_pub_->publish(joint_msg);
@@ -344,12 +365,12 @@ void UAMAdaptiveController::control_loop() {
 }
 
 // Hàm tính lực cho khớp tay máy
-Eigen::VectorXd UAMAdaptiveController::compute_joint_control() {
+Eigen::VectorXd UAMAdaptiveController::compute_joint_control(bool takeoff_sensitive) {
     Eigen::VectorXd tau_joints = Eigen::VectorXd::Zero(N_JOINTS);
     
     // CỐ ĐỊNH CÁNH TAY TRONG KHI CẤT CÁNH (TAKEOFF) hoặc CHƯA SẴN SÀNG DYNAMICS
     // Force PD control only (ignore dynamics/coupling) during sensitive takeoff phase
-    bool force_pd = (!dyn_ready_ || mission_state_ == "TAKEOFF" || mission_state_ == "ARMED" || mission_state_ == "IDLE");
+    bool force_pd = (!dyn_ready_ || takeoff_sensitive);
 
     if (force_pd) {
         for (int i = 0; i < N_JOINTS; ++i) {

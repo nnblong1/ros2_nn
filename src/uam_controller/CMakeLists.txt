@@ -58,6 +58,7 @@ install(PROGRAMS
   scripts/rbfnn_training_supervisor.py
   scripts/arm_trajectory_generator.py
   scripts/arm_initial_pose.py
+  scripts/qgc_rbfnn_trigger.py
   
   DESTINATION lib/${PROJECT_NAME}
 )

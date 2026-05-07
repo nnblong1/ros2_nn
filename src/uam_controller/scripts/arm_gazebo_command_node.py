@@ -48,13 +48,14 @@ class ArmGazeboCommandNode(Node):
     def __init__(self):
         super().__init__('arm_gazebo_command_node')
 
-        # Prefix cho Gazebo topic
-        self.declare_parameter('model_prefix', 'model/hop')
+        # Prefix cho Gazebo topic. Current x500_hop SDF hard-codes
+        # /model/x500_hop_0/arm/joint{N}/cmd_pos.
+        self.declare_parameter('model_prefix', 'model/x500_hop_0')
         prefix = self.get_parameter('model_prefix') \
                      .get_parameter_value().string_value
 
         # Build danh sách topic Gazebo (matching SDF plugin topics)
-        # New SDF uses: /model/hop/arm/joint{N}/cmd_pos
+        # Current SDF uses: /model/x500_hop_0/arm/joint{N}/cmd_pos
         self.gz_topics = []
         for idx, jname in enumerate(self.JOINT_NAMES, start=1):
             topic = f'/{prefix}/arm/joint{idx}/cmd_pos'

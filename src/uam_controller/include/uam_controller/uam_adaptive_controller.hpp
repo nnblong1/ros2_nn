@@ -6,13 +6,13 @@
 #include <px4_msgs/msg/vehicle_thrust_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_rates_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <px4_msgs/msg/vehicle_land_detected.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <px4_msgs/msg/actuator_motors.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/string.hpp>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <chrono>
@@ -97,6 +97,12 @@ private:
 
     double last_t_ = -1.0;
     static constexpr double lpf_alpha_ = 0.2; // LPF cutoff ~20Hz @ 200Hz sample rate
+    double last_odom_rx_time_ = -1.0;
+    double last_rates_sp_rx_time_ = -1.0;
+    double altitude_m_ = 0.0;
+    double vertical_speed_m_s_ = 0.0;
+    bool landed_ = true;
+    bool ground_contact_ = true;
 
     // ★ RBFNN Ramp-up Strategy: Cho phép RBFNN học từ đầu, output tăng dần
     double controller_start_time_ = -1.0;      // Thời điểm controller được enable lần đầu
@@ -121,7 +127,6 @@ private:
     bool has_joints_ = false;
     bool controller_enabled_ = false;
     bool rbfnn_output_enabled_ = false;
-    std::string mission_state_ = "IDLE";
     uint64_t px4_timestamp_ = 0;
     
     double base_pitch_offset_ = 0.0;
@@ -135,26 +140,27 @@ private:
 
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr     odom_sub_;
     rclcpp::Subscription<px4_msgs::msg::VehicleRatesSetpoint>::SharedPtr rates_sp_sub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleLandDetected>::SharedPtr land_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr       joint_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr   dyn_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                enable_sub_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr              state_sub_;
-
 
     rclcpp::TimerBase::SharedPtr timer_;
 
     // Callbacks
     void odom_cb(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);
     void rates_sp_cb(const px4_msgs::msg::VehicleRatesSetpoint::SharedPtr msg);
+    void land_cb(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg);
     void joint_cb(const sensor_msgs::msg::JointState::SharedPtr msg);
     void dyn_cb(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void enable_cb(const std_msgs::msg::Bool::SharedPtr msg);
-    void state_cb(const std_msgs::msg::String::SharedPtr msg);
 
 
     // Xử lý vòng lặp
     void control_loop();
-    Eigen::VectorXd compute_joint_control();
+    Eigen::VectorXd compute_joint_control(bool takeoff_sensitive);
     void declare_params();
     double sat(double v, double lim) const;
+    bool inputs_fresh(double now) const;
+    bool in_takeoff_sensitive_phase(double elapsed_since_enable) const;
 };

@@ -24,7 +24,7 @@ import sys
 #  J5 (Rev28): Pitch cổ tay  limit ±1.57   = -0.9  (co cổ tay)
 #  J6 (Rev30): Roll kẹp      limit ±1.57   = 0.0
 # ═══════════════════════════════════════════════════════
-INITIAL_POSITIONS = [0.0, 0.0, -2.5, 0.0, -1.55, 0.0]
+INITIAL_POSITIONS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 # Delay giữa các khớp (giây) – đủ thời gian cho khớp di chuyển đến đích
 JOINT_DELAY = 2.0
@@ -32,8 +32,7 @@ JOINT_DELAY = 2.0
 # Delay ban đầu để Gazebo sẵn sàng sau khi spawn
 STARTUP_DELAY = 3.0
 
-
-def send_joint_cmd(joint_num: int, position: float, model: str = 'hop') -> bool:
+def send_joint_cmd(joint_num: int, position: float, model: str = 'x500_hop_0') -> bool:
     """Gửi lệnh vị trí trực tiếp qua gz topic. Trả về True nếu thành công."""
     topic = f'/model/{model}/arm/joint{joint_num}/cmd_pos'
     cmd = [

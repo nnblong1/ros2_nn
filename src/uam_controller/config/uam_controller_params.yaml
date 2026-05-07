@@ -55,17 +55,17 @@ uam_adaptive_controller:
     mass_nominal: 2.35
     max_thrust: 71.6
     max_torque: 5.0
-    rate_Kd_pitch: 0.00866
-    rate_Kd_roll: 0.00866
-    rate_Kd_yaw: 0.00353
-    rate_Ki_pitch: 0.04415
-    rate_Ki_roll: 0.04415
-    rate_Ki_yaw: 0.02821
-    rate_Kp_pitch: 0.11523
-    rate_Kp_roll: 0.11523
-    rate_Kp_yaw: 0.07115
+    rate_Kd_pitch: 0.0045
+    rate_Kd_roll: 0.0045
+    rate_Kd_yaw: 0.0018
+    rate_Ki_pitch: 0.025
+    rate_Ki_roll: 0.025
+    rate_Ki_yaw: 0.015
+    rate_Kp_pitch: 0.09
+    rate_Kp_roll: 0.09
+    rate_Kp_yaw: 0.055
     rbfnn_enable: true
-    rbfnn_lr: 0.02336
+    rbfnn_lr: 0.01
     z_des: 2.0
 uam_mission_bridge:
   ros__parameters:

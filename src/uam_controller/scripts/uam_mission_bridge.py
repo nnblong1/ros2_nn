@@ -201,6 +201,7 @@ class UAMMissionBridge(Node):
             self._publish_enable(False)
             
         elif self.state == self.STATE_TAKEOFF:
+            self._publish_enable(False)
             if not hasattr(self, '_takeoff_step'): self._takeoff_step = 0
             if not hasattr(self, '_retry_timer'): self._retry_timer = 0
             
@@ -262,9 +263,11 @@ class UAMMissionBridge(Node):
                 self._retry_timer = 0
 
         elif self.state == self.STATE_HOLD:
+            self._publish_enable(True)
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
 
         elif self.state == self.STATE_GOTO:
+            self._publish_enable(True)
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
             dist = np.linalg.norm(self.current_pos - self.setpoint)
             if dist < self.pos_threshold:
