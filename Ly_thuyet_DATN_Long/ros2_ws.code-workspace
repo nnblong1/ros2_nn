@@ -1,0 +1,32 @@
+{
+	"folders": [
+		{
+			"path": "../ros2_ws"
+		},
+		{
+			"path": "../PX4-Autopilot"
+		}
+	],
+	"settings": {
+		"ROS2.distro": "humble",
+		"python.autoComplete.extraPaths": [
+			"/home/wicom/ros2_ws/install/uav_control/lib/python3.10/site-packages",
+			"/home/wicom/ros2_ws/install/uam_controller/local/lib/python3.10/dist-packages",
+			"/home/wicom/ros2_ws/install/px4_msgs/local/lib/python3.10/dist-packages",
+			"/home/wicom/ros2_ws/install/micro_ros_msgs/local/lib/python3.10/dist-packages",
+			"/home/wicom/ros2_ws/install/drive_base_msgs/local/lib/python3.10/dist-packages",
+			"/opt/ros/humble/lib/python3.10/site-packages",
+			"/opt/ros/humble/local/lib/python3.10/dist-packages"
+		],
+		"python.analysis.extraPaths": [
+			"/home/wicom/ros2_ws/install/uav_control/lib/python3.10/site-packages",
+			"/home/wicom/ros2_ws/install/uam_controller/local/lib/python3.10/dist-packages",
+			"/home/wicom/ros2_ws/install/px4_msgs/local/lib/python3.10/dist-packages",
+			"/home/wicom/ros2_ws/install/micro_ros_msgs/local/lib/python3.10/dist-packages",
+			"/home/wicom/ros2_ws/install/drive_base_msgs/local/lib/python3.10/dist-packages",
+			"/opt/ros/humble/lib/python3.10/site-packages",
+			"/opt/ros/humble/local/lib/python3.10/dist-packages"
+		],
+		"github.copilot.chat.codeGeneration.useInstructionFiles": true
+	}
+}
