@@ -551,6 +551,14 @@ class RBFNNDataLogger(Node):
             drifts.append(math.hypot(x - base_x, y - base_y))
         return drifts
 
+    def _max_joint_span(self, samples: list[dict[str, Any]], prefix: str) -> float:
+        spans = []
+        for idx in range(1, N_JOINTS + 1):
+            values = clean_values(self._values(samples, f"{prefix}_{idx}"))
+            if values:
+                spans.append(max(values) - min(values))
+        return maximum(spans)
+
     def _write_summary(self) -> None:
         if not self.samples:
             summary = {
@@ -585,10 +593,20 @@ class RBFNNDataLogger(Node):
             analysis, ("dbg_n_hat_x", "dbg_n_hat_y", "dbg_n_hat_z")
         )
         joint_cmd_norm = self._vector_norms(
-            analysis, ("joint_cmd_1", "joint_cmd_2", "joint_cmd_3")
+            analysis, tuple(f"joint_cmd_{idx}" for idx in range(1, N_JOINTS + 1))
         )
         joint_pos_norm = self._vector_norms(
-            analysis, ("joint_pos_1", "joint_pos_2", "joint_pos_3")
+            analysis, tuple(f"joint_pos_{idx}" for idx in range(1, N_JOINTS + 1))
+        )
+        joint_cmd_max = maximum(joint_cmd_norm)
+        joint_pos_max = maximum(joint_pos_norm)
+        joint_pos_span_max = self._max_joint_span(analysis, "joint_pos")
+        arm_command_seen = math.isfinite(joint_cmd_max) and joint_cmd_max > 0.05
+        arm_motion_detected = (
+            math.isfinite(joint_pos_max)
+            and joint_pos_max > 0.03
+            and math.isfinite(joint_pos_span_max)
+            and joint_pos_span_max > 0.03
         )
 
         summary = {
@@ -637,12 +655,12 @@ class RBFNNDataLogger(Node):
             },
             "arm_motion": {
                 "joint_cmd_norm_rms_rad": rms(joint_cmd_norm),
-                "joint_cmd_norm_max_rad": maximum(joint_cmd_norm),
+                "joint_cmd_norm_max_rad": joint_cmd_max,
                 "joint_pos_norm_rms_rad": rms(joint_pos_norm),
-                "joint_pos_norm_max_rad": maximum(joint_pos_norm),
-                "arm_motion_detected": maximum(joint_cmd_norm) > 0.05
-                if math.isfinite(maximum(joint_cmd_norm))
-                else False,
+                "joint_pos_norm_max_rad": joint_pos_max,
+                "joint_pos_span_max_rad": joint_pos_span_max,
+                "arm_command_seen": arm_command_seen,
+                "arm_motion_detected": arm_motion_detected,
             },
             "failure_flags": {
                 "roll_or_pitch_gt_35_deg": maximum(roll_pitch_abs) > 35.0
@@ -656,6 +674,7 @@ class RBFNNDataLogger(Node):
                 "xy_drift_gt_1m": maximum(xy_drift) > 1.0
                 if math.isfinite(maximum(xy_drift))
                 else False,
+                "arm_command_without_motion": arm_command_seen and not arm_motion_detected,
             },
         }
         summary["verdict"] = (
@@ -709,8 +728,10 @@ class RBFNNDataLogger(Node):
             "## Arm Motion",
             "",
             f"- Motion detected: `{arm['arm_motion_detected']}`",
+            f"- Command seen: `{arm['arm_command_seen']}`",
             f"- Joint command norm RMS/max: {fmt(arm['joint_cmd_norm_rms_rad'])} / {fmt(arm['joint_cmd_norm_max_rad'])} rad",
             f"- Joint actual norm RMS/max: {fmt(arm['joint_pos_norm_rms_rad'])} / {fmt(arm['joint_pos_norm_max_rad'])} rad",
+            f"- Joint actual max span: {fmt(arm['joint_pos_span_max_rad'])} rad",
             "",
             "## Failure Flags",
             "",
@@ -740,7 +761,11 @@ def main(args: list[str] | None = None) -> None:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

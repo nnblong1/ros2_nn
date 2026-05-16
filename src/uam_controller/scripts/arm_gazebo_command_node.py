@@ -41,8 +41,8 @@ class ArmGazeboCommandNode(Node):
     """Chuyển đổi JointState → publish trực tiếp tới Gazebo transport."""
 
     JOINT_NAMES = [
-        'Revolute_20', 'Revolute_22', 'Revolute_23',
-        'Revolute_26', 'Revolute_28', 'Revolute_30'
+        'Revolute 28', 'Revolute 30', 'Revolute 31',
+        'Revolute 34', 'Revolute 36', 'Revolute 38'
     ]
 
     def __init__(self):
@@ -51,8 +51,21 @@ class ArmGazeboCommandNode(Node):
         # Prefix cho Gazebo topic. Current x500_hop SDF hard-codes
         # /model/x500_hop_0/arm/joint{N}/cmd_pos.
         self.declare_parameter('model_prefix', 'model/x500_hop_0')
+        self.declare_parameter('command_topic', '/arm_controller/joint_trajectory_plan')
+        self.declare_parameter('hold_publish_rate_hz', 20.0)
+        self.declare_parameter('subprocess_pulse_period_s', 0.5)
         prefix = self.get_parameter('model_prefix') \
                      .get_parameter_value().string_value
+        self.command_topic = self.get_parameter('command_topic') \
+                                 .get_parameter_value().string_value
+        self.hold_publish_rate_hz = max(
+            1.0,
+            self.get_parameter('hold_publish_rate_hz').get_parameter_value().double_value,
+        )
+        self.subprocess_pulse_period_s = max(
+            0.0,
+            self.get_parameter('subprocess_pulse_period_s').get_parameter_value().double_value,
+        )
 
         # Build danh sách topic Gazebo (matching SDF plugin topics)
         # Current SDF uses: /model/x500_hop_0/arm/joint{N}/cmd_pos
@@ -61,23 +74,38 @@ class ArmGazeboCommandNode(Node):
             topic = f'/{prefix}/arm/joint{idx}/cmd_pos'
             self.gz_topics.append(topic)
 
+        self._gz_bin = shutil.which('gz') or shutil.which('ign')
+
         # ── Chọn phương thức publish ──
         if GZ_TRANSPORT_OK:
             self._init_gz_transport()
         else:
             self._init_subprocess_fallback()
 
+        self._last_positions = [0.0] * len(self.JOINT_NAMES)
+        self._have_command = False
+        self._command_count = 0
+        self._last_info_log = 0.0
+        self._last_subprocess_pulse = 0.0
+
         # Subscribe lệnh trajectory plan (ROS 2)
-        self.create_subscription(
+        self.sub_joint_plan = self.create_subscription(
             JointState,
-            '/arm_controller/joint_trajectory_plan',
+            self.command_topic,
             self._on_joint_plan,
             10,
+        )
+        self.hold_timer = self.create_timer(
+            1.0 / self.hold_publish_rate_hz,
+            self._publish_hold_command,
         )
 
         self.get_logger().info(
             f'Arm Gazebo Command Node started | '
-            f'method={"gz-transport" if GZ_TRANSPORT_OK else "subprocess"}'
+            f'method={"gz-transport" if GZ_TRANSPORT_OK else "subprocess"} | '
+            f'command_topic={self.command_topic} | '
+            f'hold_rate={self.hold_publish_rate_hz:.1f}Hz | '
+            f'subprocess_pulse={self.subprocess_pulse_period_s:.2f}s'
         )
         for t in self.gz_topics:
             self.get_logger().info(f'  → {t}')
@@ -96,11 +124,9 @@ class ArmGazeboCommandNode(Node):
             msg = GzDouble()
             msg.data = float(positions[i])
             pub.publish(msg)
-            time.sleep(0.05)  # Throttling chống rớt gói tin ZeroMQ khi gửi sát nhau
 
     # ──────────────── subprocess fallback ────────────────
     def _init_subprocess_fallback(self):
-        self._gz_bin = shutil.which('gz') or shutil.which('ign')
         if not self._gz_bin:
             self.get_logger().error(
                 'Không tìm thấy lệnh gz hoặc ign! '
@@ -123,9 +149,33 @@ class ArmGazeboCommandNode(Node):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                time.sleep(0.05)  # Throttling chống quá tải subprocess
             except Exception as e:
                 self.get_logger().error(f'gz topic -p failed: {e}')
+
+    def _publish_to_gazebo(self, positions, *, force_subprocess=False):
+        if GZ_TRANSPORT_OK:
+            self._publish_gz_transport(positions)
+        else:
+            self._publish_subprocess(positions)
+
+        now = time.time()
+        pulse_due = (
+            self.subprocess_pulse_period_s > 0.0
+            and now - self._last_subprocess_pulse >= self.subprocess_pulse_period_s
+        )
+        if force_subprocess or pulse_due:
+            self._last_subprocess_pulse = now
+            self._publish_subprocess(positions)
+
+    def _publish_hold_command(self):
+        if not self._have_command:
+            return
+
+        # Gazebo transport can occasionally miss single-shot commands during
+        # discovery or under load. Re-publishing the latest command turns the
+        # ROS trajectory stream into a held position setpoint for the Gazebo
+        # JointPositionController.
+        self._publish_to_gazebo(self._last_positions)
 
     # ──────────────── Callback chính ────────────────
     def _on_joint_plan(self, msg: JointState):
@@ -136,19 +186,23 @@ class ArmGazeboCommandNode(Node):
             )
             return
 
-        pos = list(msg.position[:num_expected])
+        self._last_positions = [float(p) for p in msg.position[:num_expected]]
+        self._have_command = True
+        self._command_count += 1
+        self._publish_to_gazebo(
+            self._last_positions,
+            force_subprocess=(self._command_count == 1),
+        )
 
-        if GZ_TRANSPORT_OK:
-            self._publish_gz_transport(pos)
-        else:
-            # If using subprocess fallback, do NOT loop all 6 at once.
-            # However, time.sleep(0.5) inside a 50Hz ROS2 callback will DESTROY the control loop.
-            # For dynamic control, the Python GZ bridge MUST be used.
-            # If forced to use subprocess fallback, we must warn about dropped packets
-            # but we won't sleep in the main thread.
-            self._publish_subprocess(pos)
-
-        self.get_logger().debug(f'Cmd: {pos}')
+        now = time.time()
+        if self._command_count == 1 or now - self._last_info_log > 2.0:
+            self._last_info_log = now
+            self.get_logger().info(
+                'Arm command #%d → [%s]' % (
+                    self._command_count,
+                    ', '.join(f'{p:.3f}' for p in self._last_positions),
+                )
+            )
 
 
 def main(args=None):

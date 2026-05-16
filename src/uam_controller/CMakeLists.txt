@@ -55,7 +55,6 @@ install(PROGRAMS
   scripts/uam_mission_bridge.py
   scripts/uam_telemetry_monitor.py
   scripts/rbfnn_data_logger.py
-  scripts/rbfnn_training_supervisor.py
   scripts/arm_trajectory_generator.py
   scripts/arm_initial_pose.py
   scripts/qgc_rbfnn_trigger.py

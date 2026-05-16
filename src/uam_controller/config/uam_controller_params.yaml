@@ -35,6 +35,12 @@ arm_dynamics_node:
     - 0.0298
     - 0.0448
     - 0.0149
+    use_base_motion: true
+    use_base_linear_acc: false
+    base_motion_lpf_alpha: 0.15
+    base_acc_limit_ms2: 4.0
+    base_alpha_limit_radps2: 8.0
+    joint_acc_limit_radps2: 25.0
 uam_adaptive_controller:
   ros__parameters:
     Ixx: 0.03957
@@ -66,6 +72,23 @@ uam_adaptive_controller:
     rate_Kp_yaw: 0.055
     rbfnn_enable: true
     rbfnn_lr: 0.01
+    arm_ff_enable: false
+    arm_ff_start_delay_s: 1.0
+    arm_ff_ramp_s: 5.0
+    arm_ff_rate_limit_nm_s: 0.12
+    arm_ff_lpf_alpha: 0.2
+    arm_ff_timeout_s: 0.18
+    arm_ff_max_roll_nm: 0.08
+    arm_ff_max_pitch_nm: 0.08
+    arm_ff_max_yaw_nm: 0.04
+    arm_ff_scale_roll: 0.0
+    arm_ff_scale_pitch: 0.0
+    arm_ff_scale_yaw: 0.0
+    arm_cg_comp_enable: false
+    arm_cg_roll_gain: 0.0
+    arm_cg_pitch_gain: 0.0
+    arm_cg_max_norm: 0.04
+    arm_cg_lpf_alpha: 0.1
     z_des: 2.0
 uam_mission_bridge:
   ros__parameters:

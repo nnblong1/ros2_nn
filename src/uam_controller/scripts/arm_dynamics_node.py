@@ -14,9 +14,37 @@ Tần số: 50 Hz
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from px4_msgs.msg import VehicleOdometry
 from geometry_msgs.msg import WrenchStamped
 import numpy as np
 from typing import List, Optional
+
+
+def _finite_array(values, size, default=0.0) -> np.ndarray:
+    arr = np.full(size, default, dtype=float)
+    for idx, value in enumerate(list(values)[:size]):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = default
+        if not np.isfinite(value):
+            value = default
+        arr[idx] = value
+    return arr
+
+
+def _quat_to_rot_matrix(q) -> np.ndarray:
+    """Return body-to-world rotation for PX4 quaternion [w, x, y, z]."""
+    qw, qx, qy, qz = _finite_array(q, 4)
+    norm = np.linalg.norm([qw, qx, qy, qz])
+    if norm < 1e-9:
+        return np.eye(3)
+    qw, qx, qy, qz = qw / norm, qx / norm, qy / norm, qz / norm
+    return np.array([
+        [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw), 2.0 * (qx * qz + qy * qw)],
+        [2.0 * (qx * qy + qz * qw), 1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
+        [2.0 * (qx * qz - qy * qw), 2.0 * (qy * qz + qx * qw), 1.0 - 2.0 * (qx * qx + qy * qy)],
+    ])
 
 
 # ============================================================
@@ -88,7 +116,9 @@ class RecursiveNewtonEuler:
                                     q:  np.ndarray,
                                     dq: np.ndarray,
                                     ddq: np.ndarray,
-                                    base_acc: Optional[np.ndarray] = None
+                                    base_acc: Optional[np.ndarray] = None,
+                                    base_omega: Optional[np.ndarray] = None,
+                                    base_alpha: Optional[np.ndarray] = None
                                     ) -> np.ndarray:
         """
         Tính lực và mô-men tại khớp 0 (điểm gắn vào UAV).
@@ -98,6 +128,8 @@ class RecursiveNewtonEuler:
             dq   : vận tốc khớp     shape (n,)
             ddq  : gia tốc khớp     shape (n,)
             base_acc : gia tốc thân UAV [m/s²], mặc định = trọng lực
+            base_omega : vận tốc góc thân UAV [rad/s]
+            base_alpha : gia tốc góc thân UAV [rad/s²]
 
         Trả về:
             wrench_0 : [fx, fy, fz, nx, ny, nz] tại khớp 0
@@ -105,11 +137,15 @@ class RecursiveNewtonEuler:
         n = self.n_dof
         if base_acc is None:
             base_acc = -self.GRAVITY  # gia tốc trọng trường lên trên
+        if base_omega is None:
+            base_omega = np.zeros(3)
+        if base_alpha is None:
+            base_alpha = np.zeros(3)
 
         # ── Đệ quy thuận (Forward Recursion) ──
         # Vận tốc góc ω, gia tốc góc α, gia tốc tuyến tính tại từng link
-        omega_prev  = np.zeros(3)        # ω_0 = 0
-        alpha_prev  = np.zeros(3)        # α_0 = 0
+        omega_prev  = np.array(base_omega, dtype=float).reshape(3)
+        alpha_prev  = np.array(base_alpha, dtype=float).reshape(3)
         a_prev      = base_acc.copy()    # gia tốc tại gốc
 
         omegas  = []
@@ -211,37 +247,38 @@ class ArmDynamicsNode(Node):
     def __init__(self):
         super().__init__('arm_dynamics_node')
 
-        # ── Cấu hình cánh tay 6-DoF (tham số UR5-like) ──
-        # Đây là ví dụ với cánh tay 6 khớp quay, cần thay bằng DH thực tế
-        links = [
-            DHLink(alpha= 0.0,           a=0.0,   d=0.089, mass=3.7,
-                   com=[0.0, 0.0, 0.044],
-                   inertia=np.diag([0.0071, 0.0071, 0.0033])),
-            DHLink(alpha= np.pi/2,       a=0.0,   d=0.0,   mass=8.4,
-                   com=[0.0, 0.045, 0.135],
-                   inertia=np.diag([0.022, 0.022, 0.009])),
-            DHLink(alpha= 0.0,           a=0.425, d=0.0,   mass=2.3,
-                   com=[0.0, 0.012, 0.106],
-                   inertia=np.diag([0.0050, 0.0050, 0.0020])),
-            DHLink(alpha= 0.0,           a=0.392, d=0.109, mass=1.2,
-                   com=[0.0, -0.012, 0.073],
-                   inertia=np.diag([0.0010, 0.0010, 0.0004])),
-            DHLink(alpha= np.pi/2,       a=0.0,   d=0.095, mass=1.2,
-                   com=[0.0, 0.0, 0.055],
-                   inertia=np.diag([0.0010, 0.0010, 0.0004])),
-            DHLink(alpha=-np.pi/2,       a=0.0,   d=0.082, mass=0.2,
-                   com=[0.0, 0.0, 0.012],
-                   inertia=np.diag([0.0001, 0.0001, 0.0001]))
-        ]
+        self._declare_model_parameters()
+        links = self._load_links_from_parameters()
 
         self.rne = RecursiveNewtonEuler(links)
+        self.get_logger().info(
+            "RNE arm model loaded from ROS parameters | total_mass=%.3f kg"
+            % sum(link.mass for link in links)
+        )
 
         # Trạng thái khớp hiện tại
         self.q   = np.zeros(6)
         self.dq  = np.zeros(6)
         self.ddq = np.zeros(6)
         self._prev_dq   = np.zeros(6)
+        self._prev_q    = np.zeros(6)
         self._prev_time = None
+
+        # Trạng thái base UAV. PX4 VehicleOdometry dùng frame FRD/NED; RNE này
+        # chỉ dùng thành phần động học base như một hiệu chỉnh bậc nhỏ, có clamp
+        # và LPF để tránh inject nhiễu vào feedforward.
+        self.use_base_motion = bool(self.get_parameter('use_base_motion').value)
+        self.use_base_linear_acc = bool(self.get_parameter('use_base_linear_acc').value)
+        self.base_lpf_alpha = float(self.get_parameter('base_motion_lpf_alpha').value)
+        self.base_acc_limit = float(self.get_parameter('base_acc_limit_ms2').value)
+        self.base_alpha_limit = float(self.get_parameter('base_alpha_limit_radps2').value)
+        self.joint_acc_limit = float(self.get_parameter('joint_acc_limit_radps2').value)
+        self.base_omega = np.zeros(3)
+        self.base_alpha = np.zeros(3)
+        self.base_acc_body = np.zeros(3)
+        self._prev_base_omega = np.zeros(3)
+        self._prev_base_velocity_world = np.zeros(3)
+        self._prev_odom_time = None
 
         # ── Publisher ──
         self.wrench_pub = self.create_publisher(
@@ -258,7 +295,90 @@ class ArmDynamicsNode(Node):
             10
         )
 
+        self.odom_sub = self.create_subscription(
+            VehicleOdometry,
+            '/fmu/out/vehicle_odometry',
+            self.odom_callback,
+            10
+        )
+
         self.get_logger().info("Arm Dynamics (Newton-Euler) Node khởi động.")
+
+    def _declare_model_parameters(self):
+        self.declare_parameter('dh_a', [0.0, 0.0, 0.155, 0.034, 0.0, 0.0])
+        self.declare_parameter('dh_alpha', [0.0, 1.5708, 0.0, 0.0, 1.5708, -1.5708])
+        self.declare_parameter('dh_d', [0.034, 0.0, 0.0, 0.043, 0.075, 0.035])
+        self.declare_parameter('link_lengths', [0.049, 0.155, 0.034, 0.043, 0.075, 0.035])
+        self.declare_parameter('link_masses', [0.1432, 0.0742, 0.1122, 0.0298, 0.0448, 0.0149])
+        self.declare_parameter('link_com_xyz', [])
+        self.declare_parameter('link_inertia_diag', [])
+        self.declare_parameter('use_base_motion', True)
+        self.declare_parameter('use_base_linear_acc', False)
+        self.declare_parameter('base_motion_lpf_alpha', 0.15)
+        self.declare_parameter('base_acc_limit_ms2', 4.0)
+        self.declare_parameter('base_alpha_limit_radps2', 8.0)
+        self.declare_parameter('joint_acc_limit_radps2', 25.0)
+
+    def _param_array(self, name: str, size: int, default: list[float]) -> np.ndarray:
+        values = list(self.get_parameter(name).value)
+        if len(values) < size:
+            values = list(default)
+        return _finite_array(values, size)
+
+    def _load_links_from_parameters(self) -> List[DHLink]:
+        n = 6
+        dh_a = self._param_array('dh_a', n, [0.0] * n)
+        dh_alpha = self._param_array('dh_alpha', n, [0.0] * n)
+        dh_d = self._param_array('dh_d', n, [0.0] * n)
+        lengths = self._param_array('link_lengths', n, [0.05] * n)
+        masses = self._param_array('link_masses', n, [0.05] * n)
+
+        com_values = list(self.get_parameter('link_com_xyz').value)
+        inertia_values = list(self.get_parameter('link_inertia_diag').value)
+
+        links: List[DHLink] = []
+        for i in range(n):
+            mass = max(float(masses[i]), 1e-4)
+            length = max(abs(float(lengths[i])), 1e-3)
+
+            if len(com_values) >= 3 * (i + 1):
+                com = _finite_array(com_values[3 * i:3 * i + 3], 3)
+            else:
+                # Conservative default for the small printed arm: CoM is close
+                # to the middle of the current DH displacement. This keeps the
+                # RNE feedforward in the same order as the SDF instead of the
+                # previous 17 kg UR5-like model.
+                p_i = np.array([
+                    dh_a[i],
+                    -dh_d[i] * np.sin(dh_alpha[i]),
+                    dh_d[i] * np.cos(dh_alpha[i]),
+                ])
+                if np.linalg.norm(p_i) < 1e-4:
+                    p_i = np.array([0.0, 0.0, -length])
+                com = 0.5 * p_i
+
+            if len(inertia_values) >= 3 * (i + 1):
+                inertia_diag = np.maximum(
+                    _finite_array(inertia_values[3 * i:3 * i + 3], 3),
+                    1e-7,
+                )
+            else:
+                radius = max(0.006, 0.08 * length)
+                i_transverse = max(mass * length * length / 12.0, 1e-7)
+                i_axis = max(0.5 * mass * radius * radius, 1e-7)
+                inertia_diag = np.array([i_transverse, i_transverse, i_axis])
+
+            links.append(
+                DHLink(
+                    alpha=float(dh_alpha[i]),
+                    a=float(dh_a[i]),
+                    d=float(dh_d[i]),
+                    mass=mass,
+                    com=com,
+                    inertia=np.diag(inertia_diag),
+                )
+            )
+        return links
 
     def joint_callback(self, msg: JointState):
         if len(msg.position) < 6:
@@ -278,14 +398,32 @@ class ArmDynamicsNode(Node):
         if self._prev_time is not None:
             dt = now - self._prev_time
             if dt > 0:
-                self.ddq[:] = (self.dq - self._prev_dq) / dt
+                raw_ddq = (self.dq - self._prev_dq) / dt
+                raw_ddq = np.clip(raw_ddq, -self.joint_acc_limit, self.joint_acc_limit)
+                self.ddq[:] = 0.25 * raw_ddq + 0.75 * self.ddq
 
         self._prev_dq   = self.dq.copy()
         self._prev_q    = self.q.copy()
         self._prev_time = now
 
         # Tính wrench tương tác
-        wrench = self.rne.compute_interaction_wrench(self.q, self.dq, self.ddq)
+        base_acc = None
+        base_omega = None
+        base_alpha = None
+        if self.use_base_motion:
+            base_omega = self.base_omega
+            base_alpha = self.base_alpha
+            if self.use_base_linear_acc:
+                base_acc = -self.rne.GRAVITY + self.base_acc_body
+
+        wrench = self.rne.compute_interaction_wrench(
+            self.q,
+            self.dq,
+            self.ddq,
+            base_acc=base_acc,
+            base_omega=base_omega,
+            base_alpha=base_alpha,
+        )
 
         msg_out = WrenchStamped()
         msg_out.header.stamp    = self.get_clock().now().to_msg()
@@ -297,6 +435,36 @@ class ArmDynamicsNode(Node):
         msg_out.wrench.torque.y = float(wrench[4])
         msg_out.wrench.torque.z = float(wrench[5])
         self.wrench_pub.publish(msg_out)
+
+    def odom_callback(self, msg: VehicleOdometry):
+        now = self.get_clock().now().nanoseconds / 1e9
+        omega = _finite_array(msg.angular_velocity, 3)
+        velocity_world = _finite_array(msg.velocity, 3)
+
+        if self._prev_odom_time is not None:
+            dt = now - self._prev_odom_time
+            if dt > 1e-4:
+                raw_alpha = np.clip(
+                    (omega - self._prev_base_omega) / dt,
+                    -self.base_alpha_limit,
+                    self.base_alpha_limit,
+                )
+                raw_acc_world = np.clip(
+                    (velocity_world - self._prev_base_velocity_world) / dt,
+                    -self.base_acc_limit,
+                    self.base_acc_limit,
+                )
+                rot_body_to_world = _quat_to_rot_matrix(msg.q)
+                raw_acc_body = rot_body_to_world.T @ raw_acc_world
+
+                alpha = np.clip(self.base_lpf_alpha, 0.0, 1.0)
+                self.base_alpha = alpha * raw_alpha + (1.0 - alpha) * self.base_alpha
+                self.base_acc_body = alpha * raw_acc_body + (1.0 - alpha) * self.base_acc_body
+
+        self.base_omega = omega
+        self._prev_base_omega = omega.copy()
+        self._prev_base_velocity_world = velocity_world.copy()
+        self._prev_odom_time = now
 
 
 def main(args=None):

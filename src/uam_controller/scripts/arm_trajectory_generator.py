@@ -9,7 +9,8 @@ Các pattern chuyển động:
   2. Step      — nhảy bậc giữa các vị trí ngẫu nhiên
   3. Chirp     — tần số tăng dần (quét tần số)
   4. Random    — vị trí ngẫu nhiên mượt (spline nội suy)
-  5. Combined  — kết hợp tất cả
+  5. Slow step — chuyển mượt rồi giữ lâu để PX4 có thời gian kéo UAV về vị trí
+  6. Combined  — kết hợp tất cả
 
 Cách dùng:
   # Chạy tất cả pattern, mỗi cái 60s (tổng ~5 phút)
@@ -23,6 +24,7 @@ Cách dùng:
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 import numpy as np
@@ -46,7 +48,7 @@ class ArmTrajectoryGenerator(Node):
         (-1.5, 1.5),    # Joint 6 (wrist 3)
     ]
 
-    def __init__(self, pattern, duration, amplitude, rate):
+    def __init__(self, pattern, duration, amplitude, rate, step_hold_time, transition_time):
         super().__init__('arm_trajectory_generator')
 
         self.pattern = pattern
@@ -54,6 +56,8 @@ class ArmTrajectoryGenerator(Node):
         self.amplitude = amplitude
         self.rate_hz = rate
         self.dt = 1.0 / rate
+        self._step_hold_time = max(float(step_hold_time), self.dt)
+        self._transition_time = max(float(transition_time), self.dt)
 
         # Publisher
         self.pub = self.create_publisher(
@@ -64,11 +68,17 @@ class ArmTrajectoryGenerator(Node):
 
         self.t0 = time.time()
         self.timer = self.create_timer(self.dt, self._tick)
+        self._command_count = 0
+        self._last_command_log = 0.0
 
         # Cho pattern step: thời gian giữ mỗi bước
-        self._step_hold_time = 3.0  # giây
         self._step_targets = self._random_positions()
         self._step_last_switch = 0.0
+
+        # Cho pattern slow_step: chuyển mượt rồi giữ lâu
+        self._slow_segment_idx = -1
+        self._slow_start_target = np.zeros(self.N_JOINTS)
+        self._slow_end_target = np.zeros(self.N_JOINTS)
 
         # Cho pattern random smooth: tạo waypoints
         self._rand_waypoints = [self._random_positions() for _ in range(20)]
@@ -84,6 +94,8 @@ class ArmTrajectoryGenerator(Node):
             f'  Duration  : {duration}s\n'
             f'  Amplitude : {amplitude}\n'
             f'  Rate      : {rate} Hz\n'
+            f'  Step hold : {self._step_hold_time}s\n'
+            f'  Transition: {self._transition_time}s\n'
             f'  Bắt đầu tạo chuyển động...'
         )
 
@@ -110,6 +122,29 @@ class ArmTrajectoryGenerator(Node):
                 f'  [Step] → [{", ".join(f"{v:.2f}" for v in self._step_targets)}]'
             )
         return self._step_targets
+
+    def _gen_slow_step(self, t):
+        """Chuyển mượt sang tư thế mới rồi giữ lâu để PX4 hồi vị trí."""
+        cycle = max(self._step_hold_time, self.dt)
+        transition = min(max(self._transition_time, self.dt), cycle)
+        seg_idx = int(t / cycle)
+        local_t = t - seg_idx * cycle
+
+        if seg_idx != self._slow_segment_idx:
+            self._slow_segment_idx = seg_idx
+            self._slow_start_target = self._slow_end_target.copy()
+            self._slow_end_target = self._random_positions()
+            self.get_logger().info(
+                f'  [SlowStep] transition={transition:.1f}s hold={cycle-transition:.1f}s '
+                f'→ [{", ".join(f"{v:.2f}" for v in self._slow_end_target)}]'
+            )
+
+        if local_t < transition:
+            alpha = np.clip(local_t / transition, 0.0, 1.0)
+            alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            return self._slow_start_target + alpha * (self._slow_end_target - self._slow_start_target)
+
+        return self._slow_end_target
 
     def _gen_chirp(self, t):
         """Chirp — tần số tăng dần từ 0.1 Hz đến 2 Hz."""
@@ -171,6 +206,7 @@ class ArmTrajectoryGenerator(Node):
         generators = {
             'sin': self._gen_sin,
             'step': self._gen_step,
+            'slow_step': self._gen_slow_step,
             'chirp': self._gen_chirp,
             'random': self._gen_random,
             'combined': self._gen_combined,
@@ -196,6 +232,7 @@ class ArmTrajectoryGenerator(Node):
         pos = self._dispatch(self.pattern, t)
         pos = self._clamp(pos)
         self._publish_positions(pos)
+        self._log_command_periodically(t, pos)
 
     def _publish_positions(self, pos):
         msg = JointState()
@@ -203,6 +240,18 @@ class ArmTrajectoryGenerator(Node):
         msg.name = [f'Joint_{i+1}' for i in range(self.N_JOINTS)]
         msg.position = [float(p) for p in pos]
         self.pub.publish(msg)
+        self._command_count += 1
+
+    def _log_command_periodically(self, t, pos):
+        now = time.time()
+        if self._command_count == 1 or now - self._last_command_log >= 2.0:
+            self._last_command_log = now
+            max_abs = float(np.max(np.abs(pos))) if len(pos) else 0.0
+            self.get_logger().info(
+                f'  [Cmd #{self._command_count:04d}] '
+                f't={t:6.1f}s pattern={self.pattern} max|q|={max_abs:.3f} rad '
+                f'→ [{", ".join(f"{v:.2f}" for v in pos)}]'
+            )
 
 
 def main():
@@ -211,7 +260,7 @@ def main():
     )
     parser.add_argument(
         '--pattern', type=str, default='combined',
-        choices=['sin', 'step', 'chirp', 'random', 'combined'],
+        choices=['sin', 'step', 'slow_step', 'chirp', 'random', 'combined'],
         help='Loại chuyển động (default: combined = tất cả)'
     )
     parser.add_argument(
@@ -226,6 +275,14 @@ def main():
         '--rate', type=int, default=10,
         help='Tần số publish (Hz, default: 10)'
     )
+    parser.add_argument(
+        '--step-hold-time', type=float, default=3.0,
+        help='Thời gian mỗi chu kỳ step/slow_step (giây, default: 3)'
+    )
+    parser.add_argument(
+        '--transition-time', type=float, default=1.0,
+        help='Thời gian chuyển mượt cho slow_step (giây, default: 1)'
+    )
 
     # Parse riêng để tránh xung đột với ROS2 args
     args, _ = parser.parse_known_args()
@@ -236,16 +293,26 @@ def main():
         duration=args.duration,
         amplitude=args.amplitude,
         rate=args.rate,
+        step_hold_time=args.step_hold_time,
+        transition_time=args.transition_time,
     )
 
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
+    except (KeyboardInterrupt, SystemExit, ExternalShutdownException):
         pass
     finally:
-        node.get_logger().info('Trajectory generator dừng.')
+        if rclpy.ok():
+            try:
+                node.get_logger().info('Trajectory generator dừng.')
+            except Exception:
+                pass
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

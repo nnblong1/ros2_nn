@@ -4,7 +4,7 @@ uam_telemetry_monitor.py
 ------------------------
 Monitor mở rộng cho UAM.
 Kết hợp telemetry PX4 cơ bản (pin, gps, status) và telemetry của
-adaptive controller (RBFNN, khối lượng ước lượng, CoM).
+adaptive controller (RBFNN, torque debug, arm feedforward).
 """
 
 import rclpy
@@ -31,15 +31,13 @@ class UAMTelemetryMonitor(Node):
         self.declare_parameter("battery_crit_pct", 15.0)
         self.declare_parameter("max_altitude_m", 50.0)
         self.declare_parameter("max_speed_ms", 10.0)
+        # Giữ lại tham số này để tương thích với YAML hiện tại.
         self.declare_parameter("m_hat_warn_deviation", 1.0)
-        
         self.BATT_WARN_PCT   = self.get_parameter("battery_warn_pct").value
         self.BATT_CRIT_PCT   = self.get_parameter("battery_crit_pct").value
         self.MAX_ALTITUDE_M  = self.get_parameter("max_altitude_m").value
         self.MAX_SPEED_MS    = self.get_parameter("max_speed_ms").value
         self.M_HAT_DEV       = self.get_parameter("m_hat_warn_deviation").value
-        
-        self.m_nominal       = 2.35 # kg — khối lượng danh định (UAV + arm)
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -67,11 +65,14 @@ class UAMTelemetryMonitor(Node):
         self.battery       = BatteryStatus()
         self.gps           = VehicleGlobalPosition()
         
-        self.mission_state = "UNKNOWN"
-        self.m_hat         = 0.0
-        self.rbfnn_n0      = [0.0, 0.0, 0.0]
-        self.g_cog         = [0.0, 0.0, 0.0]
-        self.joints        = []
+        self.mission_state    = "UNKNOWN"
+        self.n_hat            = [0.0, 0.0, 0.0]
+        self.tau              = [0.0, 0.0, 0.0]
+        self.tau_arm_ff       = [0.0, 0.0, 0.0]
+        self.tau_norm         = [0.0, 0.0, 0.0]
+        self.arm_ff_enabled   = False
+        self.arm_ff_fresh     = False
+        self.joints           = []
 
         self.create_timer(0.5, self._publish_telemetry)
         self.create_timer(1.0, self._safety_check)
@@ -89,10 +90,23 @@ class UAMTelemetryMonitor(Node):
             pass
 
     def _cb_debug_state(self, msg):
-        if len(msg.data) >= 20:
-            self.m_hat    = msg.data[13]
-            self.rbfnn_n0 = [msg.data[14], msg.data[15], msg.data[16]]
-            self.g_cog    = [msg.data[17], msg.data[18], msg.data[19]]
+        # Layout hiện tại từ uam_backstepping_rbfnn_node.cpp:
+        # 0..2   omega
+        # 3..5   omega_des
+        # 6..8   e_omega
+        # 9..11  n_hat
+        # 12..14 tau
+        # 15..17 tau_arm_ff
+        # 18..20 tau_norm
+        # 21     arm_ff_enabled
+        # 22     arm_ff_fresh
+        if len(msg.data) >= 23:
+            self.n_hat          = [msg.data[9], msg.data[10], msg.data[11]]
+            self.tau            = [msg.data[12], msg.data[13], msg.data[14]]
+            self.tau_arm_ff     = [msg.data[15], msg.data[16], msg.data[17]]
+            self.tau_norm       = [msg.data[18], msg.data[19], msg.data[20]]
+            self.arm_ff_enabled = msg.data[21] > 0.5
+            self.arm_ff_fresh   = msg.data[22] > 0.5
             
     def _cb_joint_states(self, msg):
         self.joints = list(msg.position)
@@ -128,9 +142,12 @@ class UAMTelemetryMonitor(Node):
             },
             "failsafe":    self.status.failsafe,
             "uam_metrics": {
-                "m_hat": round(self.m_hat, 2),
-                "rbfnn_n0": [round(v, 2) for v in self.rbfnn_n0],
-                "g_cog": [round(v, 2) for v in self.g_cog]
+                "n_hat": [round(v, 2) for v in self.n_hat],
+                "tau": [round(v, 2) for v in self.tau],
+                "tau_arm_ff": [round(v, 2) for v in self.tau_arm_ff],
+                "tau_norm": [round(v, 2) for v in self.tau_norm],
+                "arm_ff_enabled": self.arm_ff_enabled,
+                "arm_ff_fresh": self.arm_ff_fresh
             }
         }
 
@@ -148,9 +165,6 @@ class UAMTelemetryMonitor(Node):
         alt = abs(self.local.z)
         if alt > self.MAX_ALTITUDE_M:
             self.get_logger().warn(f"⚠️  Độ cao cao: {alt:.1f} m (giới hạn {self.MAX_ALTITUDE_M} m)")
-
-        if self.m_hat > 0.0 and abs(self.m_hat - self.m_nominal) > self.M_HAT_DEV:
-            self.get_logger().warn(f"⚖️  Khối lượng ước lượng m̂ ({self.m_hat:.2f} kg) sai lệch lớn so với {self.m_nominal} kg!")
 
         if self.status.failsafe:
             self.get_logger().error("🛑 FAILSAFE đã kích hoạt!")

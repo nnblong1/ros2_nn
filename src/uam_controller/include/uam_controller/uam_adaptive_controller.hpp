@@ -11,6 +11,7 @@
 #include <px4_msgs/msg/actuator_motors.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <Eigen/Dense>
@@ -45,8 +46,8 @@ struct JointGains { double Kp=50.0, Kd=5.0; };
 
 struct RBFNNParams {
     int    num_neurons    = 25;
-    int    input_dim      = 9;    // Z = [e_p, e_q, e_r, p_d, q_d, r_d, p, q, r]
-    int    output_dim     = 3;    // [n_x, n_y, n_z]
+    int    input_dim      = 6;    // X = [p, q, r, e_p, e_q, e_r]
+    int    output_dim     = 3;    // angular acceleration disturbance estimate [rad/s^2]
     double learning_rate  = 0.1;
     double e_modification = 0.01;
     double gaussian_width = 1.0;
@@ -93,22 +94,40 @@ private:
     Eigen::Vector3d e_omega_int_  = Eigen::Vector3d::Zero();  // Integral accumulator
     Eigen::Vector3d e_omega_prev_ = Eigen::Vector3d::Zero();  // Previous error for D-term
     Eigen::Vector3d e_omega_dot_prev_ = Eigen::Vector3d::Zero(); // LPF on D-term
-    Eigen::Vector3d n_hat_        = Eigen::Vector3d::Zero();
+    Eigen::Vector3d n_hat_        = Eigen::Vector3d::Zero();  // RBFNN angular acceleration estimate
+    Eigen::Vector3d tau_arm_ff_   = Eigen::Vector3d::Zero();  // RNE feedforward torque [Nm]
+    Eigen::Vector3d tau_arm_ff_target_ = Eigen::Vector3d::Zero(); // filtered target before ramp/rate limit
+    Eigen::Vector3d tau_axis_max_ = Eigen::Vector3d::Constant(5.0); // Nm -> normalized PX4 torque
 
     double last_t_ = -1.0;
     static constexpr double lpf_alpha_ = 0.2; // LPF cutoff ~20Hz @ 200Hz sample rate
     double last_odom_rx_time_ = -1.0;
     double last_rates_sp_rx_time_ = -1.0;
+    double last_arm_wrench_rx_time_ = -1.0;
     double altitude_m_ = 0.0;
     double vertical_speed_m_s_ = 0.0;
     bool landed_ = true;
     bool ground_contact_ = true;
+    bool arm_ff_enabled_ = false;
+    double arm_ff_timeout_s_ = 0.15;
+    double arm_ff_lpf_alpha_ = 0.2;
+    double arm_ff_start_delay_s_ = 1.0;
+    double arm_ff_ramp_s_ = 5.0;
+    double arm_ff_rate_limit_nm_s_ = 0.15;
+    Eigen::Vector3d arm_ff_limit_ = Eigen::Vector3d::Constant(0.25);
+    Eigen::Vector3d arm_ff_scale_ = Eigen::Vector3d::Ones();
+    bool arm_cg_comp_enabled_ = false;
+    double arm_cg_roll_gain_ = 0.0;
+    double arm_cg_pitch_gain_ = 0.0;
+    double arm_cg_max_norm_ = 0.04;
+    double arm_cg_lpf_alpha_ = 0.1;
+    Eigen::Vector2d arm_cg_bias_norm_ = Eigen::Vector2d::Zero();
 
     // ★ RBFNN Ramp-up Strategy: Cho phép RBFNN học từ đầu, output tăng dần
     double controller_start_time_ = -1.0;      // Thời điểm controller được enable lần đầu
-    static constexpr double RAMP_PHASE1_END = 3.0;   // 0-3s: output max ±0.05
-    static constexpr double RAMP_PHASE2_END = 8.0;   // 3-8s: output max ±0.15
-    static constexpr double RAMP_FULL_LIMIT = 0.50;  // >8s:  output max ±0.50
+    static constexpr double RAMP_PHASE1_END = 3.0;   // 0-3s: NN accel max ±0.05 rad/s^2
+    static constexpr double RAMP_PHASE2_END = 8.0;   // 3-8s: NN accel max ±0.15 rad/s^2
+    static constexpr double RAMP_FULL_LIMIT = 0.50;  // >8s:  NN accel max ±0.50 rad/s^2
     static constexpr double RAMP_P1_LIMIT   = 0.05;
     static constexpr double RAMP_P2_LIMIT   = 0.15;
 
@@ -125,6 +144,7 @@ private:
     bool has_odom_ = false;
     bool has_rates_sp_ = false;
     bool has_joints_ = false;
+    bool has_arm_wrench_ = false;
     bool controller_enabled_ = false;
     bool rbfnn_output_enabled_ = false;
     uint64_t px4_timestamp_ = 0;
@@ -143,6 +163,7 @@ private:
     rclcpp::Subscription<px4_msgs::msg::VehicleLandDetected>::SharedPtr land_sub_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr       joint_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr   dyn_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr   arm_wrench_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                enable_sub_;
 
     rclcpp::TimerBase::SharedPtr timer_;
@@ -153,6 +174,7 @@ private:
     void land_cb(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg);
     void joint_cb(const sensor_msgs::msg::JointState::SharedPtr msg);
     void dyn_cb(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+    void arm_wrench_cb(const geometry_msgs::msg::WrenchStamped::SharedPtr msg);
     void enable_cb(const std_msgs::msg::Bool::SharedPtr msg);
 
 
@@ -161,6 +183,11 @@ private:
     Eigen::VectorXd compute_joint_control(bool takeoff_sensitive);
     void declare_params();
     double sat(double v, double lim) const;
+    Eigen::Vector3d sat_vec(const Eigen::Vector3d& v, const Eigen::Vector3d& lim) const;
+    Eigen::Vector3d rate_limit_vec(const Eigen::Vector3d& current, const Eigen::Vector3d& target, double max_delta) const;
+    void update_arm_feedforward(double elapsed_since_enable, double dt, bool takeoff_sensitive);
+    void update_arm_cg_bias();
     bool inputs_fresh(double now) const;
+    bool arm_ff_fresh(double now) const;
     bool in_takeoff_sensitive_phase(double elapsed_since_enable) const;
 };

@@ -27,7 +27,7 @@ Cách dùng:
   ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true
 
   # Phần cứng thật
-  ros2 launch uam_controller uam_qgc_mode.launch.py
+  ros2 launch uam_controller uam_qgc_mode.launch.py sim:=false xrce_serial_dev:=/dev/ttyACM0
 """
 
 import os
@@ -109,6 +109,24 @@ def generate_launch_description():
         description='Tần số ghi dữ liệu thí nghiệm'
     )
 
+    arg_start_xrce_agent = DeclareLaunchArgument(
+        'start_xrce_agent',
+        default_value='true',
+        description='true = launch tự chạy MicroXRCEAgent | false = agent đã chạy ở terminal/service khác'
+    )
+
+    arg_xrce_serial_dev = DeclareLaunchArgument(
+        'xrce_serial_dev',
+        default_value='/dev/ttyAMA0',
+        description='Thiết bị serial cho MicroXRCEAgent khi sim=false, ví dụ /dev/ttyAMA0, /dev/ttyUSB0, /dev/ttyACM0'
+    )
+
+    arg_xrce_baud = DeclareLaunchArgument(
+        'xrce_baud',
+        default_value='921600',
+        description='Baudrate uXRCE-DDS serial khi sim=false'
+    )
+
     sim          = LaunchConfiguration('sim')
     config_file  = LaunchConfiguration('config_file')
     enable_rbfnn = LaunchConfiguration('enable_rbfnn')
@@ -118,26 +136,29 @@ def generate_launch_description():
     experiment_case = LaunchConfiguration('experiment_case')
     experiment_output_root = LaunchConfiguration('experiment_output_root')
     experiment_log_rate_hz = LaunchConfiguration('experiment_log_rate_hz')
+    start_xrce_agent = LaunchConfiguration('start_xrce_agent')
+    xrce_serial_dev = LaunchConfiguration('xrce_serial_dev')
+    xrce_baud = LaunchConfiguration('xrce_baud')
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 0 – Micro XRCE-DDS Agent
     #  Cầu nối PX4 ↔ ROS 2 (telemetry + OFFBOARD setpoints)
-    #  Hardware : UART /dev/ttyAMA0 @ 921600 bps
+    #  Hardware : configurable serial device @ configurable baud
     #  Sim      : UDP port 8888
     # ═══════════════════════════════════════════════════════════
 
     xrce_hardware = ExecuteProcess(
-        cmd=['MicroXRCEAgent', 'serial', '--dev', '/dev/ttyAMA0', '-b', '921600'],
+        cmd=['MicroXRCEAgent', 'serial', '--dev', xrce_serial_dev, '-b', xrce_baud],
         name='micro_xrce_dds_agent',
         output='screen',
-        condition=UnlessCondition(sim)
+        condition=IfCondition(PythonExpression(["'", sim, "' == 'false' and '", start_xrce_agent, "' == 'true'"]))
     )
 
     xrce_sim = ExecuteProcess(
         cmd=['MicroXRCEAgent', 'udp4', '-p', '8888'],
         name='micro_xrce_dds_agent_sim',
         output='screen',
-        condition=IfCondition(sim)
+        condition=IfCondition(PythonExpression(["'", sim, "' == 'true' and '", start_xrce_agent, "' == 'true'"]))
     )
 
     # ═══════════════════════════════════════════════════════════
@@ -266,7 +287,8 @@ def generate_launch_description():
             '╔══════════════════════════════════════════════════════════╗\n'
             '║           UAM QGroundControl Mode - Ready                ║\n'
             '╠══════════════════════════════════════════════════════════╣\n'
-            '║  QGC kết nối tự động qua UDP:14550                       ║\n'
+            '║  SITL: QGC kết nối tự động qua UDP:14550                  ║\n'
+            '║  Real: kiểm tra XRCE serial + QGC trước khi arm           ║\n'
             '║                                                          ║\n'
             '║  Bước 1: Khởi động PX4 SITL (terminal riêng):            ║\n'
             '║    cd ~/PX4-Autopilot && make px4_sitl gz_x500_hop       ║\n'
@@ -315,6 +337,9 @@ def generate_launch_description():
         arg_experiment_case,
         arg_experiment_output_root,
         arg_log_rate_hz,
+        arg_start_xrce_agent,
+        arg_xrce_serial_dev,
+        arg_xrce_baud,
         # ── Hướng dẫn ──
         startup_info,
         # ── DDS Agent (khởi động ngay) ──
