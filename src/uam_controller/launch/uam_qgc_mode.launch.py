@@ -162,7 +162,7 @@ def generate_launch_description():
     )
 
     # ═══════════════════════════════════════════════════════════
-    #  NODE 1 – RBFNN Backstepping Controller (C++, 100 Hz)
+    #  NODE 1 – RBFNN Backstepping Controller (C++, 200 Hz)
     #  Chỉ publish Torque/Thrust khi nhận cờ enable từ qgc_rbfnn_trigger.
     # ═══════════════════════════════════════════════════════════
 
@@ -210,6 +210,19 @@ def generate_launch_description():
         package='uam_controller',
         executable='arm_gazebo_command_node.py',
         name='arm_gazebo_command_node',
+        output='screen',
+        condition=IfCondition(sim)
+    )
+
+    # ═══════════════════════════════════════════════════════════
+    #  NODE 3.5 – Arm Joint State Bridge (Sim only)
+    #  Chuyển Gazebo JointStatePublisher → ROS /joint_states cho RNE/logger.
+    # ═══════════════════════════════════════════════════════════
+
+    arm_joint_state_bridge_node = Node(
+        package='uam_controller',
+        executable='arm_gazebo_joint_state_bridge.py',
+        name='arm_gazebo_joint_state_bridge',
         output='screen',
         condition=IfCondition(sim)
     )
@@ -313,7 +326,7 @@ def generate_launch_description():
     #  t=0s   DDS Agent + Startup info
     #  t=2s   RBFNN Controller (chờ DDS ổn định)
     #  t=2.5s Arm Dynamics
-    #  t=3s   Arm Cmd Bridge (sim)
+    #  t=3s   Arm Cmd Bridge + Joint State Bridge (sim)
     #  t=2s   Arm Initial Pose (sim) → tự chờ thêm 3s bên trong
     #  t=3.5s Telemetry Monitor
     #  t=4s   Data Logger
@@ -322,6 +335,7 @@ def generate_launch_description():
     delayed_backstepping  = TimerAction(period=2.0,  actions=[backstepping_node])
     delayed_arm_dynamics  = TimerAction(period=2.5,  actions=[arm_dynamics_node])
     delayed_arm_cmd       = TimerAction(period=3.0,  actions=[arm_cmd_node])
+    delayed_arm_js_bridge = TimerAction(period=3.0,  actions=[arm_joint_state_bridge_node])
     delayed_arm_pose      = TimerAction(period=2.0,  actions=[arm_initial_pose_node])
     delayed_telemetry     = TimerAction(period=3.5,  actions=[telemetry_node])
     delayed_logger        = TimerAction(period=4.0,  actions=[data_logger_node])
@@ -349,6 +363,7 @@ def generate_launch_description():
         delayed_backstepping,
         delayed_arm_dynamics,
         delayed_arm_cmd,
+        delayed_arm_js_bridge,
         delayed_arm_pose,
         delayed_telemetry,
         delayed_logger,

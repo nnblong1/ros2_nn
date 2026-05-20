@@ -41,16 +41,15 @@ class ArmGazeboCommandNode(Node):
     """Chuyển đổi JointState → publish trực tiếp tới Gazebo transport."""
 
     JOINT_NAMES = [
-        'Revolute 28', 'Revolute 30', 'Revolute 31',
-        'Revolute 34', 'Revolute 36', 'Revolute 38'
+        'Revolute_20', 'Revolute_22', 'Revolute_23',
+        'Revolute_26', 'Revolute_28', 'Revolute_30'
     ]
 
     def __init__(self):
         super().__init__('arm_gazebo_command_node')
 
-        # Prefix cho Gazebo topic. Current x500_hop SDF hard-codes
-        # /model/x500_hop_0/arm/joint{N}/cmd_pos.
-        self.declare_parameter('model_prefix', 'model/x500_hop_0')
+        # Match x500_hop/model.sdf JointPositionController topics.
+        self.declare_parameter('model_prefix', 'model/x500_hop')
         self.declare_parameter('command_topic', '/arm_controller/joint_trajectory_plan')
         self.declare_parameter('hold_publish_rate_hz', 20.0)
         self.declare_parameter('subprocess_pulse_period_s', 0.5)
@@ -67,12 +66,12 @@ class ArmGazeboCommandNode(Node):
             self.get_parameter('subprocess_pulse_period_s').get_parameter_value().double_value,
         )
 
-        # Build danh sách topic Gazebo (matching SDF plugin topics)
-        # Current SDF uses: /model/x500_hop_0/arm/joint{N}/cmd_pos
-        self.gz_topics = []
-        for idx, jname in enumerate(self.JOINT_NAMES, start=1):
-            topic = f'/{prefix}/arm/joint{idx}/cmd_pos'
-            self.gz_topics.append(topic)
+        # Build danh sách topic Gazebo matching SDF:
+        # /model/x500_hop/joint/Revolute_20/cmd_pos, ...
+        self.gz_topics = [
+            f'/{prefix}/joint/{joint_name}/cmd_pos'
+            for joint_name in self.JOINT_NAMES
+        ]
 
         self._gz_bin = shutil.which('gz') or shutil.which('ign')
 

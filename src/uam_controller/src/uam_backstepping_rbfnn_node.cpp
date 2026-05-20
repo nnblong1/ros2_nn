@@ -102,6 +102,9 @@ void UAMAdaptiveController::declare_params() {
     declare_parameter("Ixx", sys_.Ixx);
     declare_parameter("Iyy", sys_.Iyy);
     declare_parameter("Izz", sys_.Izz);
+    declare_parameter("Ixy", sys_.Ixy);
+    declare_parameter("Ixz", sys_.Ixz);
+    declare_parameter("Iyz", sys_.Iyz);
     declare_parameter("max_torque", sys_.max_torque);
     declare_parameter("max_joint_tau", sys_.max_joint_tau);
     declare_parameter("gravity", sys_.gravity);
@@ -138,6 +141,8 @@ void UAMAdaptiveController::declare_params() {
     declare_parameter("arm_ff_scale_roll", arm_ff_scale_(0));
     declare_parameter("arm_ff_scale_pitch", arm_ff_scale_(1));
     declare_parameter("arm_ff_scale_yaw", arm_ff_scale_(2));
+    declare_parameter("arm_ff_input_frame", arm_ff_input_frame_);
+    declare_parameter("arm_ff_reaction_sign", arm_ff_reaction_sign_);
     declare_parameter("arm_cg_comp_enable", arm_cg_comp_enabled_);
     declare_parameter("arm_cg_roll_gain", arm_cg_roll_gain_);
     declare_parameter("arm_cg_pitch_gain", arm_cg_pitch_gain_);
@@ -148,6 +153,9 @@ void UAMAdaptiveController::declare_params() {
     sys_.Ixx          = get_parameter("Ixx").as_double();
     sys_.Iyy          = get_parameter("Iyy").as_double();
     sys_.Izz          = get_parameter("Izz").as_double();
+    sys_.Ixy          = get_parameter("Ixy").as_double();
+    sys_.Ixz          = get_parameter("Ixz").as_double();
+    sys_.Iyz          = get_parameter("Iyz").as_double();
     sys_.max_torque   = get_parameter("max_torque").as_double();
     sys_.max_joint_tau= get_parameter("max_joint_tau").as_double();
     sys_.gravity      = get_parameter("gravity").as_double();
@@ -189,6 +197,8 @@ void UAMAdaptiveController::declare_params() {
     arm_ff_scale_(0) = std::clamp(get_parameter("arm_ff_scale_roll").as_double(), -1.5, 1.5);
     arm_ff_scale_(1) = std::clamp(get_parameter("arm_ff_scale_pitch").as_double(), -1.5, 1.5);
     arm_ff_scale_(2) = std::clamp(get_parameter("arm_ff_scale_yaw").as_double(), -1.5, 1.5);
+    arm_ff_input_frame_ = get_parameter("arm_ff_input_frame").as_string();
+    arm_ff_reaction_sign_ = get_parameter("arm_ff_reaction_sign").as_double() < 0.0 ? -1.0 : 1.0;
     arm_cg_comp_enabled_ = get_parameter("arm_cg_comp_enable").as_bool();
     arm_cg_roll_gain_ = get_parameter("arm_cg_roll_gain").as_double();
     arm_cg_pitch_gain_ = get_parameter("arm_cg_pitch_gain").as_double();
@@ -255,11 +265,31 @@ void UAMAdaptiveController::dyn_cb(const std_msgs::msg::Float64MultiArray::Share
 }
 
 void UAMAdaptiveController::arm_wrench_cb(const geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
-    Eigen::Vector3d raw_tau(
+    const Eigen::Vector3d tau_msg(
         msg->wrench.torque.x,
         msg->wrench.torque.y,
         msg->wrench.torque.z);
 
+    Eigen::Vector3d raw_tau = tau_msg;
+
+    // arm_dynamics_node publishes in Gazebo/base_link convention by default:
+    // X forward, Y left, Z up (FLU-like). PX4 VehicleTorqueSetpoint expects
+    // body FRD: X forward, Y right, Z down. Convert before applying sign/scale.
+    if (arm_ff_input_frame_ == "flu" || arm_ff_input_frame_ == "gazebo" || arm_ff_input_frame_ == "base_link") {
+        raw_tau = Eigen::Vector3d(tau_msg(0), -tau_msg(1), -tau_msg(2));
+    } else if (arm_ff_input_frame_ == "frd" || arm_ff_input_frame_ == "px4") {
+        raw_tau = tau_msg;
+    } else {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            5000,
+            "Unknown arm_ff_input_frame='%s'. Assuming PX4 FRD.",
+            arm_ff_input_frame_.c_str());
+        raw_tau = tau_msg;
+    }
+
+    raw_tau *= arm_ff_reaction_sign_;
     raw_tau = arm_ff_scale_.cwiseProduct(raw_tau);
     raw_tau = sat_vec(raw_tau, arm_ff_limit_);
     tau_arm_ff_target_ = arm_ff_lpf_alpha_ * raw_tau + (1.0 - arm_ff_lpf_alpha_) * tau_arm_ff_target_;
@@ -444,7 +474,10 @@ void UAMAdaptiveController::control_loop() {
         
         // 3. Luật Điều Khiển Rate - Backstepping + RBFNN + RNE feedforward
         // PX4 internal rate gains = 0 → node này là nguồn torque DUY NHẤT
-        Eigen::Matrix3d J_mat = Eigen::Vector3d(sys_.Ixx, sys_.Iyy, sys_.Izz).asDiagonal();
+        Eigen::Matrix3d J_mat;
+        J_mat << sys_.Ixx, sys_.Ixy, sys_.Ixz,
+                 sys_.Ixy, sys_.Iyy, sys_.Iyz,
+                 sys_.Ixz, sys_.Iyz, sys_.Izz;
         Eigen::Vector3d coriolis = omega_.cross(J_mat * omega_);
         Eigen::Matrix3d Kp_mat = Eigen::Vector3d(rate_gains_.K_roll, rate_gains_.K_pitch, rate_gains_.K_yaw).asDiagonal();
         Eigen::Matrix3d Ki_mat = Eigen::Vector3d(rate_gains_.Ki_roll, rate_gains_.Ki_pitch, rate_gains_.Ki_yaw).asDiagonal();

@@ -47,6 +47,22 @@ def _quat_to_rot_matrix(q) -> np.ndarray:
     ])
 
 
+def _axis_angle_to_rot(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = np.array(axis, dtype=float).reshape(3)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-9:
+        return np.eye(3)
+    x, y, z = axis / norm
+    c = np.cos(angle)
+    s = np.sin(angle)
+    C = 1.0 - c
+    return np.array([
+        [c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+        [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+        [z * x * C - y * s, z * y * C + x * s, c + z * z * C],
+    ])
+
+
 # ============================================================
 #  Cấu trúc thông số hình học một Link (Denavit-Hartenberg)
 # ============================================================
@@ -239,6 +255,114 @@ class RecursiveNewtonEuler:
         return np.concatenate([f_next, n_next])
 
 
+class SDFSerialArmDynamics:
+    """
+    Lightweight serial-arm wrench model using joint origins, joint axes, CoM,
+    mass, and inertia extracted from the Gazebo SDF at the zero pose.
+
+    This avoids forcing the imported CAD arm into a simplified DH convention
+    when the SDF joint axes are mixed Y/Z axes.
+    """
+
+    GRAVITY = np.array([0.0, 0.0, -9.81])
+
+    def __init__(self,
+                 joint_origins: np.ndarray,
+                 joint_axes: np.ndarray,
+                 link_masses: np.ndarray,
+                 link_coms: np.ndarray,
+                 link_inertias: np.ndarray):
+        self.joint_origins = np.array(joint_origins, dtype=float).reshape(-1, 3)
+        self.joint_axes = np.array(joint_axes, dtype=float).reshape(-1, 3)
+        self.link_masses = np.array(link_masses, dtype=float).reshape(-1)
+        self.link_coms = np.array(link_coms, dtype=float).reshape(-1, 3)
+        self.link_inertias = np.array(link_inertias, dtype=float).reshape(-1, 3, 3)
+        self.n_dof = len(self.link_masses)
+
+        if not (
+            len(self.joint_origins) == len(self.joint_axes) == len(self.link_coms) == self.n_dof
+        ):
+            raise ValueError("SDF serial arm parameter lengths must all match")
+
+        for i in range(self.n_dof):
+            norm = np.linalg.norm(self.joint_axes[i])
+            if norm < 1e-9:
+                raise ValueError(f"joint_axis_xyz[{i}] is zero")
+            self.joint_axes[i] = self.joint_axes[i] / norm
+
+    def compute_interaction_wrench(self,
+                                    q: np.ndarray,
+                                    dq: np.ndarray,
+                                    ddq: np.ndarray,
+                                    base_acc: Optional[np.ndarray] = None,
+                                    base_omega: Optional[np.ndarray] = None,
+                                    base_alpha: Optional[np.ndarray] = None
+                                    ) -> np.ndarray:
+        if base_acc is None:
+            base_acc = -self.GRAVITY
+        if base_omega is None:
+            base_omega = np.zeros(3)
+        if base_alpha is None:
+            base_alpha = np.zeros(3)
+
+        parent_R = np.eye(3)
+        parent_omega = np.array(base_omega, dtype=float).reshape(3)
+        parent_alpha = np.array(base_alpha, dtype=float).reshape(3)
+
+        joint_origin = self.joint_origins[0].copy()
+        joint_acc = (
+            np.array(base_acc, dtype=float).reshape(3)
+            + np.cross(parent_alpha, joint_origin)
+            + np.cross(parent_omega, np.cross(parent_omega, joint_origin))
+        )
+
+        total_force = np.zeros(3)
+        total_torque = np.zeros(3)
+
+        for i in range(self.n_dof):
+            axis = parent_R @ self.joint_axes[i]
+            child_R = parent_R @ _axis_angle_to_rot(self.joint_axes[i], q[i])
+
+            omega = parent_omega + axis * dq[i]
+            alpha = (
+                parent_alpha
+                + axis * ddq[i]
+                + np.cross(parent_omega, axis * dq[i])
+            )
+
+            r_com = child_R @ self.link_coms[i]
+            com_acc = (
+                joint_acc
+                + np.cross(alpha, r_com)
+                + np.cross(omega, np.cross(omega, r_com))
+            )
+            inertia_world = child_R @ self.link_inertias[i] @ child_R.T
+
+            force = self.link_masses[i] * com_acc
+            torque = (
+                np.cross(joint_origin + r_com, force)
+                + inertia_world @ alpha
+                + np.cross(omega, inertia_world @ omega)
+            )
+
+            total_force += force
+            total_torque += torque
+
+            if i < self.n_dof - 1:
+                r_next = child_R @ (self.joint_origins[i + 1] - self.joint_origins[i])
+                joint_acc = (
+                    joint_acc
+                    + np.cross(alpha, r_next)
+                    + np.cross(omega, np.cross(omega, r_next))
+                )
+                joint_origin = joint_origin + r_next
+                parent_R = child_R
+                parent_omega = omega
+                parent_alpha = alpha
+
+        return np.concatenate([total_force, total_torque])
+
+
 # ============================================================
 #  Node ROS2
 # ============================================================
@@ -248,13 +372,21 @@ class ArmDynamicsNode(Node):
         super().__init__('arm_dynamics_node')
 
         self._declare_model_parameters()
-        links = self._load_links_from_parameters()
+        self.use_sdf_kinematics = bool(self.get_parameter('use_sdf_kinematics').value)
 
-        self.rne = RecursiveNewtonEuler(links)
-        self.get_logger().info(
-            "RNE arm model loaded from ROS parameters | total_mass=%.3f kg"
-            % sum(link.mass for link in links)
-        )
+        if self.use_sdf_kinematics:
+            self.arm_model = self._load_sdf_serial_model_from_parameters()
+            self.get_logger().info(
+                "SDF serial arm model loaded from ROS parameters | total_moving_mass=%.3f kg"
+                % float(np.sum(self.arm_model.link_masses))
+            )
+        else:
+            links = self._load_links_from_parameters()
+            self.arm_model = RecursiveNewtonEuler(links)
+            self.get_logger().info(
+                "DH RNE arm model loaded from ROS parameters | total_mass=%.3f kg"
+                % sum(link.mass for link in links)
+            )
 
         # Trạng thái khớp hiện tại
         self.q   = np.zeros(6)
@@ -312,6 +444,10 @@ class ArmDynamicsNode(Node):
         self.declare_parameter('link_masses', [0.1432, 0.0742, 0.1122, 0.0298, 0.0448, 0.0149])
         self.declare_parameter('link_com_xyz', [])
         self.declare_parameter('link_inertia_diag', [])
+        self.declare_parameter('link_inertia_full', [])
+        self.declare_parameter('use_sdf_kinematics', False)
+        self.declare_parameter('joint_origin_xyz', [])
+        self.declare_parameter('joint_axis_xyz', [])
         self.declare_parameter('use_base_motion', True)
         self.declare_parameter('use_base_linear_acc', False)
         self.declare_parameter('base_motion_lpf_alpha', 0.15)
@@ -380,6 +516,46 @@ class ArmDynamicsNode(Node):
             )
         return links
 
+    def _load_sdf_serial_model_from_parameters(self) -> SDFSerialArmDynamics:
+        n = 6
+        origins = self._param_array('joint_origin_xyz', 3 * n, [0.0] * (3 * n)).reshape(n, 3)
+        axes = self._param_array(
+            'joint_axis_xyz',
+            3 * n,
+            [
+                0.0, 0.0, -1.0,
+                0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, -1.0,
+                0.0, 1.0, 0.0,
+                0.0, -1.0, 0.0,
+            ],
+        ).reshape(n, 3)
+        masses = self._param_array('link_masses', n, [0.05] * n)
+        coms = self._param_array('link_com_xyz', 3 * n, [0.0] * (3 * n)).reshape(n, 3)
+        inertia_diag = self._param_array(
+            'link_inertia_diag',
+            3 * n,
+            [1e-5, 1e-5, 1e-5] * n,
+        ).reshape(n, 3)
+        full_values = list(self.get_parameter('link_inertia_full').value)
+        if len(full_values) >= 9 * n:
+            inertias = _finite_array(full_values, 9 * n).reshape(n, 3, 3)
+            inertias = 0.5 * (inertias + np.swapaxes(inertias, 1, 2))
+            for idx in range(n):
+                if np.any(np.linalg.eigvalsh(inertias[idx]) <= 1e-10):
+                    inertias[idx] = np.diag(np.maximum(inertia_diag[idx], 1e-9))
+        else:
+            inertias = np.array([np.diag(np.maximum(row, 1e-9)) for row in inertia_diag])
+
+        return SDFSerialArmDynamics(
+            joint_origins=origins,
+            joint_axes=axes,
+            link_masses=np.maximum(masses, 1e-5),
+            link_coms=coms,
+            link_inertias=inertias,
+        )
+
     def joint_callback(self, msg: JointState):
         if len(msg.position) < 6:
             return
@@ -414,9 +590,9 @@ class ArmDynamicsNode(Node):
             base_omega = self.base_omega
             base_alpha = self.base_alpha
             if self.use_base_linear_acc:
-                base_acc = -self.rne.GRAVITY + self.base_acc_body
+                base_acc = -self.arm_model.GRAVITY + self.base_acc_body
 
-        wrench = self.rne.compute_interaction_wrench(
+        wrench = self.arm_model.compute_interaction_wrench(
             self.q,
             self.dq,
             self.ddq,

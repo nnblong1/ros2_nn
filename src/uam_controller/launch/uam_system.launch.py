@@ -152,6 +152,14 @@ def generate_launch_description():
         condition=IfCondition(sim)
     )
 
+    arm_joint_state_bridge_node = Node(
+        package='uam_controller',
+        executable='arm_gazebo_joint_state_bridge.py',
+        name='arm_gazebo_joint_state_bridge',
+        output='screen',
+        condition=IfCondition(sim)
+    )
+
     # ═══════════════════════════════════════════════════════════
     #  NODE 4.5 – Arm Initial Pose (run once then exit)
     #  Gửi góc ban đầu cho cánh tay để co vào trước khi takeoff
@@ -193,6 +201,7 @@ def generate_launch_description():
     )
 
     delayed_arm_cmd      = TimerAction(period=1.0,   actions=[arm_cmd_node])
+    delayed_arm_js_bridge = TimerAction(period=1.0,  actions=[arm_joint_state_bridge_node])
     delayed_arm_pose     = TimerAction(period=2.0,   actions=[arm_initial_pose_proc])  # t=2s: script tự chờ 3s nữa → joint đầu tiên lúc t≈5s
     delayed_backstepping = TimerAction(period=2.0,   actions=[backstepping_node])
     delayed_arm_dynamics = TimerAction(period=2.5,   actions=[arm_dynamics_node])
@@ -215,6 +224,7 @@ def generate_launch_description():
         delayed_backstepping,
         delayed_arm_dynamics,
         delayed_arm_cmd,
+        delayed_arm_js_bridge,
         delayed_arm_pose,    # Gửi tư thế co tay sau 5s
         delayed_telemetry,
         delayed_logger,

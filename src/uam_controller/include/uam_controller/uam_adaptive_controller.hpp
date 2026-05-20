@@ -21,12 +21,15 @@
 using namespace std::chrono_literals;
 
 struct UAMSystemParams {
-    double mass_nominal = 2.5; 
+    double mass_nominal = 2.503868111; 
     double gravity      = 9.81;
-    double Ixx          = 0.029; 
-    double Iyy          = 0.029;
-    double Izz          = 0.055;
-    double max_torque   = 5.0;   
+    double Ixx          = 0.0498920943; 
+    double Iyy          = 0.0530802134;
+    double Izz          = 0.023633241;
+    double Ixy          = 0.0000031976;
+    double Ixz          = -0.0021257404;
+    double Iyz          = 0.0002444194;
+    double max_torque   = 5.6911624;   
     double max_joint_tau= 20.0;  
 };
 
@@ -116,6 +119,8 @@ private:
     double arm_ff_rate_limit_nm_s_ = 0.15;
     Eigen::Vector3d arm_ff_limit_ = Eigen::Vector3d::Constant(0.25);
     Eigen::Vector3d arm_ff_scale_ = Eigen::Vector3d::Ones();
+    std::string arm_ff_input_frame_ = "flu";
+    double arm_ff_reaction_sign_ = 1.0;
     bool arm_cg_comp_enabled_ = false;
     double arm_cg_roll_gain_ = 0.0;
     double arm_cg_pitch_gain_ = 0.0;

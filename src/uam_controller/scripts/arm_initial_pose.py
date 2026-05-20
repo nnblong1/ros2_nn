@@ -17,7 +17,7 @@ import sys
 # ═══════════════════════════════════════════════════════
 #  GÓC KHỞI ĐẦU (rad) – Tư thế "co tay" tránh va chạm
 #
-#  J1 (Rev20): Yaw vai       limit ±π      = 0.0
+#  J1 (Rev20): Yaw vai       limit ±pi     = 0.0
 #  J2 (Rev22): Pitch shoulder <lower>-1.6</lower><upper>1.6</upper> (nâng vai LÊN TRÊN)
 #  J3 (Rev23): Pitch elbow   <lower>-2.617993</lower> <upper>1.570796</upper> (gập khuỷu)
 #  J4 (Rev26): Yaw cổ tay    limit ±π      = 0.0
@@ -32,9 +32,16 @@ JOINT_DELAY = 2.0
 # Delay ban đầu để Gazebo sẵn sàng sau khi spawn
 STARTUP_DELAY = 3.0
 
-def send_joint_cmd(joint_num: int, position: float, model: str = 'x500_hop_0') -> bool:
+SDF_JOINT_NAMES = [
+    'Revolute_20', 'Revolute_22', 'Revolute_23',
+    'Revolute_26', 'Revolute_28', 'Revolute_30',
+]
+
+
+def send_joint_cmd(joint_num: int, position: float, model: str = 'x500_hop') -> bool:
     """Gửi lệnh vị trí trực tiếp qua gz topic. Trả về True nếu thành công."""
-    topic = f'/model/{model}/arm/joint{joint_num}/cmd_pos'
+    joint_name = SDF_JOINT_NAMES[joint_num - 1]
+    topic = f'/model/{model}/joint/{joint_name}/cmd_pos'
     cmd = [
         'gz', 'topic',
         '-t', topic,
@@ -45,12 +52,12 @@ def send_joint_cmd(joint_num: int, position: float, model: str = 'x500_hop_0') -
         result = subprocess.run(cmd, timeout=5.0,
                                 capture_output=True, text=True)
         if result.returncode != 0:
-            print(f'[WARN] joint{joint_num}: gz topic returncode={result.returncode} '
+            print(f'[WARN] {joint_name}: gz topic returncode={result.returncode} '
                   f'stderr={result.stderr.strip()}')
             return False
         return True
     except subprocess.TimeoutExpired:
-        print(f'[ERROR] joint{joint_num}: timeout gửi lệnh!')
+        print(f'[ERROR] {joint_name}: timeout gửi lệnh!')
         return False
     except FileNotFoundError:
         print('[ERROR] Không tìm thấy lệnh `gz`. Kiểm tra PATH.')
@@ -63,7 +70,7 @@ def main():
 
     print('[arm_initial_pose] Bắt đầu gửi lệnh co tay (sequential bypass mode)...')
     for i, pos in enumerate(INITIAL_POSITIONS, start=1):
-        print(f'  → Khớp {i}: {pos:.3f} rad')
+        print(f'  → {SDF_JOINT_NAMES[i - 1]}: {pos:.3f} rad')
         ok = send_joint_cmd(i, pos)
         if not ok:
             print(f'  [WARN] Khớp {i} có thể chưa nhận được lệnh, tiếp tục...')

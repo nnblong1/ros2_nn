@@ -57,6 +57,7 @@ install(PROGRAMS
   scripts/rbfnn_data_logger.py
   scripts/arm_trajectory_generator.py
   scripts/arm_initial_pose.py
+  scripts/arm_gazebo_joint_state_bridge.py
   scripts/qgc_rbfnn_trigger.py
   
   DESTINATION lib/${PROJECT_NAME}

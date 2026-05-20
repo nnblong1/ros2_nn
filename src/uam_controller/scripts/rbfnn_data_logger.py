@@ -138,12 +138,17 @@ class RBFNNDataLogger(Node):
         self.declare_parameter("output_root", str(PX4_RESULTS_ROOT))
         self.declare_parameter("log_rate_hz", 20.0)
         self.declare_parameter("target_alt_m", 2.0)
+        self.declare_parameter("analysis_settle_after_enable_s", 2.0)
         self.declare_parameter("notes", "")
 
         self.case_name = safe_case_name(self.get_parameter("case_name").value)
         self.output_root = Path(str(self.get_parameter("output_root").value)).expanduser()
         self.log_rate_hz = max(1.0, float(self.get_parameter("log_rate_hz").value))
         self.target_alt_m = float(self.get_parameter("target_alt_m").value)
+        self.analysis_settle_after_enable_s = max(
+            0.0,
+            float(self.get_parameter("analysis_settle_after_enable_s").value),
+        )
         self.notes = str(self.get_parameter("notes").value)
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -345,6 +350,7 @@ class RBFNNDataLogger(Node):
             "output_directory": str(self.run_dir),
             "target_alt_m": self.target_alt_m,
             "log_rate_hz": self.log_rate_hz,
+            "analysis_settle_after_enable_s": self.analysis_settle_after_enable_s,
             "notes": self.notes,
             "files": {
                 "timeseries_csv": str(self.csv_path),
@@ -513,6 +519,15 @@ class RBFNNDataLogger(Node):
     def _select_analysis_samples(self) -> tuple[str, list[dict[str, Any]]]:
         external_samples = [s for s in self.samples if bool(s.get("controller_enabled", False))]
         if external_samples:
+            first_enable_t = finite(external_samples[0].get("t_s", math.nan))
+            settled_start_t = first_enable_t + self.analysis_settle_after_enable_s
+            settled_samples = [
+                s
+                for s in external_samples
+                if finite(s.get("t_s", math.nan)) >= settled_start_t
+            ]
+            if len(settled_samples) >= max(10, int(self.log_rate_hz)):
+                return "external_enabled_settled", settled_samples
             return "external_enabled", external_samples
 
         flight_samples = [
@@ -524,6 +539,15 @@ class RBFNNDataLogger(Node):
             return "armed_or_airborne", flight_samples
 
         return "all_samples", list(self.samples)
+
+    def _sample_duration(self, samples: list[dict[str, Any]]) -> float:
+        if len(samples) < 2:
+            return 0.0
+        first_t = finite(samples[0].get("t_s", math.nan))
+        last_t = finite(samples[-1].get("t_s", math.nan))
+        if not (math.isfinite(first_t) and math.isfinite(last_t)):
+            return 0.0
+        return max(0.0, last_t - first_t)
 
     def _values(self, samples: list[dict[str, Any]], key: str) -> list[float]:
         return [finite(s.get(key, math.nan)) for s in samples]
@@ -576,6 +600,11 @@ class RBFNNDataLogger(Node):
         duration_s = max(0.0, last_t - first_t)
         enabled_samples = [s for s in self.samples if bool(s.get("controller_enabled", False))]
         first_enable_t = finite(enabled_samples[0].get("t_s", math.nan)) if enabled_samples else math.nan
+        last_enable_t = finite(enabled_samples[-1].get("t_s", math.nan)) if enabled_samples else math.nan
+        external_enabled_duration_s = self._sample_duration(enabled_samples)
+        analysis_start_t = finite(analysis[0].get("t_s", math.nan)) if analysis else math.nan
+        analysis_end_t = finite(analysis[-1].get("t_s", math.nan)) if analysis else math.nan
+        analysis_duration_s = self._sample_duration(analysis)
         enabled_fraction = len(enabled_samples) / len(self.samples)
 
         alt = self._values(analysis, "alt_m")
@@ -600,6 +629,7 @@ class RBFNNDataLogger(Node):
         )
         joint_cmd_max = maximum(joint_cmd_norm)
         joint_pos_max = maximum(joint_pos_norm)
+        joint_cmd_span_max = self._max_joint_span(analysis, "joint_cmd")
         joint_pos_span_max = self._max_joint_span(analysis, "joint_pos")
         arm_command_seen = math.isfinite(joint_cmd_max) and joint_cmd_max > 0.05
         arm_motion_detected = (
@@ -618,8 +648,14 @@ class RBFNNDataLogger(Node):
             "analysis_samples": len(analysis),
             "duration_s": duration_s,
             "target_alt_m": self.target_alt_m,
+            "analysis_settle_after_enable_s": self.analysis_settle_after_enable_s,
+            "analysis_start_s": analysis_start_t,
+            "analysis_end_s": analysis_end_t,
+            "analysis_duration_s": analysis_duration_s,
             "external_enabled_fraction": enabled_fraction,
+            "external_enabled_duration_s": external_enabled_duration_s,
             "time_first_external_enable_s": first_enable_t,
+            "time_last_external_enable_s": last_enable_t,
             "altitude": {
                 "mean_m": mean(alt),
                 "min_m": minimum(alt),
@@ -656,6 +692,7 @@ class RBFNNDataLogger(Node):
             "arm_motion": {
                 "joint_cmd_norm_rms_rad": rms(joint_cmd_norm),
                 "joint_cmd_norm_max_rad": joint_cmd_max,
+                "joint_cmd_span_max_rad": joint_cmd_span_max,
                 "joint_pos_norm_rms_rad": rms(joint_pos_norm),
                 "joint_pos_norm_max_rad": joint_pos_max,
                 "joint_pos_span_max_rad": joint_pos_span_max,
@@ -707,7 +744,9 @@ class RBFNNDataLogger(Node):
             f"- Analysis phase: `{summary['analysis_phase']}`",
             f"- Duration: {fmt(summary['duration_s'])} s",
             f"- Samples: {summary['samples']} total, {summary['analysis_samples']} analyzed",
+            f"- Analysis window: {fmt(summary['analysis_start_s'])}-{fmt(summary['analysis_end_s'])} s ({fmt(summary['analysis_duration_s'])} s)",
             f"- External enabled fraction: {fmt(summary['external_enabled_fraction'], 4)}",
+            f"- External enabled duration: {fmt(summary['external_enabled_duration_s'])} s",
             f"- First external enable: {fmt(summary['time_first_external_enable_s'])} s",
             "",
             "## Hover Metrics",
@@ -730,6 +769,7 @@ class RBFNNDataLogger(Node):
             f"- Motion detected: `{arm['arm_motion_detected']}`",
             f"- Command seen: `{arm['arm_command_seen']}`",
             f"- Joint command norm RMS/max: {fmt(arm['joint_cmd_norm_rms_rad'])} / {fmt(arm['joint_cmd_norm_max_rad'])} rad",
+            f"- Joint command max span: {fmt(arm['joint_cmd_span_max_rad'])} rad",
             f"- Joint actual norm RMS/max: {fmt(arm['joint_pos_norm_rms_rad'])} / {fmt(arm['joint_pos_norm_max_rad'])} rad",
             f"- Joint actual max span: {fmt(arm['joint_pos_span_max_rad'])} rad",
             "",
