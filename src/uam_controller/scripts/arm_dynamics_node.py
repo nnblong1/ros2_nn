@@ -13,6 +13,7 @@ Tần số: 50 Hz
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
 from px4_msgs.msg import VehicleOdometry
 from geometry_msgs.msg import WrenchStamped
@@ -442,12 +443,12 @@ class ArmDynamicsNode(Node):
         self.declare_parameter('dh_d', [0.034, 0.0, 0.0, 0.043, 0.075, 0.035])
         self.declare_parameter('link_lengths', [0.049, 0.155, 0.034, 0.043, 0.075, 0.035])
         self.declare_parameter('link_masses', [0.1432, 0.0742, 0.1122, 0.0298, 0.0448, 0.0149])
-        self.declare_parameter('link_com_xyz', [])
-        self.declare_parameter('link_inertia_diag', [])
-        self.declare_parameter('link_inertia_full', [])
+        self.declare_parameter('link_com_xyz', Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter('link_inertia_diag', Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter('link_inertia_full', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('use_sdf_kinematics', False)
-        self.declare_parameter('joint_origin_xyz', [])
-        self.declare_parameter('joint_axis_xyz', [])
+        self.declare_parameter('joint_origin_xyz', Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter('joint_axis_xyz', Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter('use_base_motion', True)
         self.declare_parameter('use_base_linear_acc', False)
         self.declare_parameter('base_motion_lpf_alpha', 0.15)

@@ -39,7 +39,7 @@ from launch.actions import (
     LogInfo,
 )
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression, EnvironmentVariable
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -87,7 +87,7 @@ def generate_launch_description():
 
     arg_start_data_logger = DeclareLaunchArgument(
         'start_data_logger',
-        default_value='true',
+        default_value='false',
         description='true = ghi dữ liệu thí nghiệm ra CSV/JSON/Markdown'
     )
 
@@ -99,7 +99,7 @@ def generate_launch_description():
 
     arg_experiment_output_root = DeclareLaunchArgument(
         'experiment_output_root',
-        default_value='/home/wicom/PX4-Autopilot/Tools/simulation/gz/pid_search_results/uam_verification',
+        default_value=[EnvironmentVariable('HOME'), '/uam_verification_logs'],
         description='Thư mục gốc để lưu kết quả kiểm chứng'
     )
 

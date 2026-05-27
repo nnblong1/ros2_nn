@@ -92,23 +92,30 @@ class TelemetryMonitor(Node):
         speed = math.sqrt(
             self.local.vx**2 + self.local.vy**2 + self.local.vz**2)
 
-        arm_state_map = {
-            VehicleStatus.ARMING_STATE_INIT:     "INIT",
-            VehicleStatus.ARMING_STATE_STANDBY:  "STANDBY",
-            VehicleStatus.ARMING_STATE_ARMED:    "ARMED",
-            VehicleStatus.ARMING_STATE_STANDBY_ERROR: "STANDBY_ERROR",
-            VehicleStatus.ARMING_STATE_SHUTDOWN: "SHUTDOWN",
-        }
+        arm_state_map = self._enum_map(
+            VehicleStatus,
+            [
+                ("ARMING_STATE_INIT", "INIT"),
+                ("ARMING_STATE_STANDBY", "STANDBY"),
+                ("ARMING_STATE_DISARMED", "DISARMED"),
+                ("ARMING_STATE_ARMED", "ARMED"),
+                ("ARMING_STATE_STANDBY_ERROR", "STANDBY_ERROR"),
+                ("ARMING_STATE_SHUTDOWN", "SHUTDOWN"),
+            ],
+        )
         arm_str = arm_state_map.get(self.status.arming_state, "UNKNOWN")
 
-        nav_state_map = {
-            VehicleStatus.NAVIGATION_STATE_MANUAL:   "MANUAL",
-            VehicleStatus.NAVIGATION_STATE_OFFBOARD: "OFFBOARD",
-            VehicleStatus.NAVIGATION_STATE_AUTO_MISSION: "MISSION",
-            VehicleStatus.NAVIGATION_STATE_AUTO_LOITER: "LOITER",
-            VehicleStatus.NAVIGATION_STATE_AUTO_RTL:    "RTL",
-            VehicleStatus.NAVIGATION_STATE_AUTO_LAND:   "LAND",
-        }
+        nav_state_map = self._enum_map(
+            VehicleStatus,
+            [
+                ("NAVIGATION_STATE_MANUAL", "MANUAL"),
+                ("NAVIGATION_STATE_OFFBOARD", "OFFBOARD"),
+                ("NAVIGATION_STATE_AUTO_MISSION", "MISSION"),
+                ("NAVIGATION_STATE_AUTO_LOITER", "LOITER"),
+                ("NAVIGATION_STATE_AUTO_RTL", "RTL"),
+                ("NAVIGATION_STATE_AUTO_LAND", "LAND"),
+            ],
+        )
         nav_str = nav_state_map.get(self.status.nav_state, "OTHER")
 
         data = {
@@ -140,6 +147,14 @@ class TelemetryMonitor(Node):
         msg = String()
         msg.data = json.dumps(data)
         self.pub_telem.publish(msg)
+
+    @staticmethod
+    def _enum_map(msg_type, entries):
+        return {
+            getattr(msg_type, name): label
+            for name, label in entries
+            if hasattr(msg_type, name)
+        }
 
     # ═══════════════════════════════════════════════════════════════════════
     # Safety checks

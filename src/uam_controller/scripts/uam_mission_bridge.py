@@ -16,6 +16,7 @@ from px4_msgs.msg import (
     VehicleStatus, 
     VehicleOdometry, 
     VehicleCommand,
+    VehicleCommandAck,
     OffboardControlMode,
     TrajectorySetpoint
 )
@@ -32,6 +33,7 @@ import json
 class UAMMissionBridge(Node):
     STATE_IDLE      = "IDLE"
     STATE_ARMED     = "ARMED"
+    STATE_PRIME_OFFBOARD = "PRIME_OFFBOARD"
     STATE_TAKEOFF   = "TAKEOFF"
     STATE_HOLD      = "HOLD"
     STATE_GOTO      = "GOTO"
@@ -45,11 +47,14 @@ class UAMMissionBridge(Node):
         self.declare_parameter("cruise_speed", 2.0)
         self.declare_parameter("position_threshold", 0.25)
         self.declare_parameter("loop_rate_hz", 20.0)
+        self.declare_parameter("offboard_prime_duration_s", 1.5)
 
         self.takeoff_height = self.get_parameter("takeoff_height").value
         self.cruise_speed   = self.get_parameter("cruise_speed").value
         self.pos_threshold  = self.get_parameter("position_threshold").value
         self.rate_hz        = self.get_parameter("loop_rate_hz").value
+        self.offboard_prime_duration_s = self.get_parameter("offboard_prime_duration_s").value
+        self.offboard_prime_ticks = max(1, int(math.ceil(self.offboard_prime_duration_s * self.rate_hz)))
 
         qos_reliable = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -73,6 +78,7 @@ class UAMMissionBridge(Node):
         # ── Subscribers ──
         self.sub_status = self.create_subscription(VehicleStatus, "/fmu/out/vehicle_status_v1", self._cb_status, qos_sensor)
         self.sub_odom   = self.create_subscription(VehicleOdometry, "/fmu/out/vehicle_odometry", self._cb_odom, qos_sensor)
+        self.sub_cmd_ack = self.create_subscription(VehicleCommandAck, "/fmu/out/vehicle_command_ack", self._cb_vehicle_command_ack, qos_sensor)
         self.sub_goto   = self.create_subscription(PoseStamped, "/uam/cmd/goto_pose", self._cb_goto_cmd, qos_reliable)
 
         # ── Services ──
@@ -92,24 +98,54 @@ class UAMMissionBridge(Node):
         self.state          = self.STATE_IDLE
         self.initialized    = False
         self.px4_timestamp  = 0
+        self.offboard_counter = 0
+        self._prime_counter = 0
+        self._takeoff_step = 0
+        self._takeoff_timer = 0
+        self._retry_timer = 0
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self._control_loop)
         self.get_logger().info("✅ UAM Mission Bridge (PX4 Position Commander) sẵn sàng!")
+        self.get_logger().info(
+            f"   Offboard prime: {self.offboard_prime_duration_s:.2f}s "
+            f"({self.offboard_prime_ticks} ticks @ {self.rate_hz:.1f} Hz)"
+        )
 
     def _cb_status(self, msg: VehicleStatus):
         if self.vehicle_status.nav_state != msg.nav_state or self.vehicle_status.arming_state != msg.arming_state:
             self.get_logger().info(f"🔔 PX4 Status Change: NavState={msg.nav_state}, ArmingState={msg.arming_state}")
         self.vehicle_status = msg
-        self.px4_timestamp = msg.timestamp
+        self._update_px4_timestamp(msg.timestamp)
 
     def _cb_odom(self, msg: VehicleOdometry):
         # Trực tiếp dùng NED từ Odometry để điều khiển hệ PX4
         self.current_pos = np.array([msg.position[0], msg.position[1], msg.position[2]])
+        self._update_px4_timestamp(msg.timestamp)
         q = msg.q
         siny = 2.0 * (q[0] * q[3] + q[1] * q[2])
         cosy = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3])
         self.current_yaw = math.atan2(siny, cosy)
         self.initialized = True
+
+    def _cb_vehicle_command_ack(self, msg: VehicleCommandAck):
+        watched_commands = (
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM,
+        )
+        if msg.command not in watched_commands:
+            return
+
+        command_name = self._vehicle_command_name(msg.command)
+        result_name = self._vehicle_command_ack_result_name(msg.result)
+        text = (
+            f"PX4 ACK {command_name}: {result_name} "
+            f"(result={msg.result}, result_param1={msg.result_param1}, "
+            f"result_param2={msg.result_param2})"
+        )
+        if msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_ACCEPTED:
+            self.get_logger().info(text)
+        else:
+            self.get_logger().warn(text)
 
     def _cb_goto_cmd(self, msg: PoseStamped):
         # Đổi toạ độ ROS ENU sang NED
@@ -124,32 +160,31 @@ class UAMMissionBridge(Node):
     def _srv_arm_takeoff(self, request, response):
         if not self.initialized:
             response.success = False
-            response.message = "Chưa có odometry để cất cánh!"
+            response.message = "Chưa nhận /fmu/out/vehicle_odometry, không gửi lệnh Offboard/ARM sang PX4."
             return response
         if self.state != self.STATE_IDLE:
             response.success = False
             response.message = f"Đang ở trạng thái {self.state}"
             return response
-            
-        if getattr(self, "offboard_counter", 0) < 10:
-            response.success = False
-            response.message = "Chưa đủ 10 nhịp gửi tín hiệu Offboard, thử lại sau 1 giây!"
-            return response
 
         self.get_logger().info(f"🚀 Lệnh cất cánh nhận được. Đang chuẩn bị (NED Z={self.takeoff_height}m)...")
-        self._publish_enable(True)
         
         # Lưu toạ độ hiện tại làm điểm bắt đầu
         self.setpoint     = np.array([self.current_pos[0], self.current_pos[1], self.current_pos[2]])
         self.setpoint_yaw = self.current_yaw
         
-        # Chuyển trạng thái sang TAKEOFF ngay để bắt đầu luồng lệnh
-        self.state = self.STATE_TAKEOFF
+        # Prime Offboard heartbeat/setpoint trước khi PX4 cho phép switch mode.
+        self.state = self.STATE_PRIME_OFFBOARD
+        self._prime_counter = 0
         self._takeoff_step = 0
         self._takeoff_timer = 0
+        self._retry_timer = 0
             
         response.success = True
-        response.message = "Đã nhận lệnh cất cánh, đang thực hiện trình tự Arm + Offboard..."
+        response.message = (
+            f"Đã nhận lệnh cất cánh, đang prime Offboard {self.offboard_prime_duration_s:.2f}s "
+            "trước khi gửi lệnh mode/ARM..."
+        )
         return response
 
     def _srv_land(self, request, response):
@@ -193,24 +228,40 @@ class UAMMissionBridge(Node):
         self._publish_offboard_mode()
 
         if self.state == self.STATE_IDLE:
-            if not hasattr(self, "offboard_counter"):
-                self.offboard_counter = 0
             self.offboard_counter += 1
             # Bắn toạ độ giữ nguyên vị trí đất để PX4 làm quen
             self._publish_setpoint(self.current_pos, self.current_yaw)
             self._publish_enable(False)
+
+        elif self.state == self.STATE_PRIME_OFFBOARD:
+            self._publish_enable(False)
+            self._publish_setpoint(self.setpoint, self.setpoint_yaw)
+            self._prime_counter += 1
+
+            if self._prime_counter == 1 or self._prime_counter % max(1, int(self.rate_hz)) == 0:
+                self.get_logger().info(
+                    f"⏳ Priming Offboard signal {self._prime_counter}/{self.offboard_prime_ticks} ticks..."
+                )
+
+            if self._prime_counter >= self.offboard_prime_ticks:
+                self.get_logger().info("✅ Đã prime đủ Offboard signal. Bắt đầu trình tự OFFBOARD -> ARM.")
+                self.state = self.STATE_TAKEOFF
+                self._takeoff_step = 0
+                self._takeoff_timer = 0
+                self._retry_timer = 0
             
         elif self.state == self.STATE_TAKEOFF:
             self._publish_enable(False)
-            if not hasattr(self, '_takeoff_step'): self._takeoff_step = 0
-            if not hasattr(self, '_retry_timer'): self._retry_timer = 0
             
-            # Step 0: Request OFFBOARD Mode (NavState 14)
+            # Step 0: Request OFFBOARD Mode
             if self._takeoff_step == 0:
-                if self.vehicle_status.nav_state != 14:
+                if self.vehicle_status.nav_state != VehicleStatus.NAVIGATION_STATE_OFFBOARD:
                     self._retry_timer += 1
                     if self._retry_timer % 20 == 1: # Once per second
-                        self.get_logger().info("⏳ 1. Đang yêu cầu OFFBOARD (nav_state=14)...")
+                        self.get_logger().info(
+                            f"⏳ 1. Đang yêu cầu OFFBOARD "
+                            f"(nav_state={VehicleStatus.NAVIGATION_STATE_OFFBOARD})..."
+                        )
                         self._publish_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
                 else:
                     self.get_logger().info("✅ Đã vào OFFBOARD mode.")
@@ -219,12 +270,15 @@ class UAMMissionBridge(Node):
                 self._publish_setpoint(self.setpoint, self.setpoint_yaw)
                 return
 
-            # Step 1: Request ARM (ArmingState 2)
+            # Step 1: Request ARM
             if self._takeoff_step == 1:
-                if self.vehicle_status.arming_state != 2: # ARMED=2
+                if self.vehicle_status.arming_state != VehicleStatus.ARMING_STATE_ARMED:
                     self._retry_timer += 1
                     if self._retry_timer % 20 == 1:
-                        self.get_logger().info("⏳ 2. Đang yêu cầu ARM (arming_state=2)...")
+                        self.get_logger().info(
+                            f"⏳ 2. Đang yêu cầu ARM "
+                            f"(arming_state={VehicleStatus.ARMING_STATE_ARMED})..."
+                        )
                         self._publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
                 else:
                     self.get_logger().info("✅ Đã ARM động cơ.")
@@ -289,7 +343,7 @@ class UAMMissionBridge(Node):
 
     def _publish_vehicle_command(self, command: int, param1: float = 0.0, param2: float = 0.0):
         msg = VehicleCommand()
-        msg.timestamp          = self.get_clock().now().nanoseconds // 1000
+        msg.timestamp          = self._timestamp_us()
         msg.command            = command
         msg.param1             = float(param1)
         msg.param2             = float(param2)
@@ -307,7 +361,7 @@ class UAMMissionBridge(Node):
         # PX4 Rate Controller gains = 0 nên không xung đột.
         # ⚠️ KHÔNG ĐƯỢC dùng direct_actuator=True, nó sẽ tắt pipeline rate setpoint!
         msg = OffboardControlMode()
-        msg.timestamp    = self.get_clock().now().nanoseconds // 1000
+        msg.timestamp    = self._timestamp_us()
         msg.position     = True
         msg.velocity     = False
         msg.acceleration = False
@@ -317,7 +371,7 @@ class UAMMissionBridge(Node):
 
     def _publish_setpoint(self, pos: np.ndarray, yaw: float):
         msg = TrajectorySetpoint()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.timestamp = self._timestamp_us()
         msg.position  = pos.astype(float).tolist()
         msg.yaw       = float(yaw)
         msg.velocity  = [float('nan')] * 3
@@ -340,6 +394,36 @@ class UAMMissionBridge(Node):
         msg = String()
         msg.data = json.dumps(state_info)
         self.pub_state_str.publish(msg)
+
+    def _update_px4_timestamp(self, timestamp: int):
+        if timestamp:
+            self.px4_timestamp = int(timestamp)
+
+    def _timestamp_us(self) -> int:
+        # PX4 expects timestamps in its boot-time clock domain. Using ROS wall time
+        # makes OffboardControlMode look stale/future-dated to commander.
+        if self.px4_timestamp:
+            return int(self.px4_timestamp)
+        return self.get_clock().now().nanoseconds // 1000
+
+    def _vehicle_command_name(self, command: int) -> str:
+        names = {
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE: "VEHICLE_CMD_DO_SET_MODE",
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM: "VEHICLE_CMD_COMPONENT_ARM_DISARM",
+        }
+        return names.get(command, f"VehicleCommand({command})")
+
+    def _vehicle_command_ack_result_name(self, result: int) -> str:
+        names = {
+            VehicleCommandAck.VEHICLE_CMD_RESULT_ACCEPTED: "ACCEPTED",
+            VehicleCommandAck.VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED: "TEMPORARILY_REJECTED",
+            VehicleCommandAck.VEHICLE_CMD_RESULT_DENIED: "DENIED",
+            VehicleCommandAck.VEHICLE_CMD_RESULT_UNSUPPORTED: "UNSUPPORTED",
+            VehicleCommandAck.VEHICLE_CMD_RESULT_FAILED: "FAILED",
+            VehicleCommandAck.VEHICLE_CMD_RESULT_IN_PROGRESS: "IN_PROGRESS",
+            VehicleCommandAck.VEHICLE_CMD_RESULT_CANCELLED: "CANCELLED",
+        }
+        return names.get(result, f"UNKNOWN({result})")
 
 def main(args=None):
     rclpy.init(args=args)

@@ -34,9 +34,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray
 
 
-PX4_RESULTS_ROOT = Path(
-    "/home/wicom/PX4-Autopilot/Tools/simulation/gz/pid_search_results/uam_verification"
-)
+PX4_RESULTS_ROOT = Path.home() / "uam_verification_logs"
 N_JOINTS = 6
 N_AXES = 3
 

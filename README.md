@@ -1,273 +1,128 @@
-# UAM PX4 + Gazebo Simulation Runbook
+Nếu `/fmu/out/...` đã có dữ liệu ổn định, đi theo thứ tự này. Đừng bật external controller ngay.
+# Terminal 1: QGC/MAVLink qua USB
+mavlink-routerd /dev/ttyACM0:2000000 -e IP_LAPTOP_QGC:14550
+(ip a để lấy IP_LAPTOP_QGC)
 
-Tài liệu này tổng hợp luồng chạy end-to-end cho đề tài UAM quadrotor + robot arm 6 DoF:
+# Terminal 2: XRCE-DDS qua TELEM2
+sudo MicroXRCEAgent serial --dev /dev/ttyS0 -b 921600
 
-- PX4 SITL + Gazebo
-- QGroundControl takeoff / hover
-- chuyển sang external backstepping + RBFNN
-- kích hoạt cánh tay để tạo nhiễu
-- ghi log, phân tích kết quả, và tuning tham số
-
-## 1. Cấu trúc liên quan
-
-- `models/x500_hop/model.sdf`: mô hình UAV + arm + plugin Gazebo
-- `tools/`: các script chạy mô phỏng, bridge topic, logger, analyzer
-- `~/ros2_ws/src/uam_controller`: launch file, controller node, arm node, logger node
-
-## 2. Chuẩn bị môi trường
-
-Mỗi terminal ROS2 nên source đúng môi trường:
+(MTF 01P - TELEM3 - SER_TEL3_BAUD:115200)
+**1. Chạy baseline PX4 internal**
+Terminal Pi:
+# Terminal 3: ROS 2 nodes, không start lại Agent
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
+source ~/ros2_nn/install/setup.bash
+
+ros2 launch uam_controller uam_qgc_mode.launch.py \
+  sim:=false \
+  start_xrce_agent:=false \
+  enable_rbfnn:=false \
+  start_data_logger:=false
 ```
 
-Build lại khi có thay đổi code:
+
+**2. Kiểm tra telemetry trước khi arm**
+Terminal khác:
 
 ```bash
-cd ~/ros2_ws
-colcon build --packages-select uam_controller
+  source ~/ros2_nn/install/setup.bash
 
-cd ~/PX4-Autopilot
-make px4_sitl gz_x500_hop
+  ros2 topic echo /fmu/out/vehicle_status_v1 --once
+  ros2 topic echo /fmu/out/vehicle_odometry --once
+  ros2 topic echo /fmu/out/vehicle_land_detected --once
 ```
 
-Khi cần bắt đầu một phiên mô phỏng sạch:
+Kiểm tra thêm QGC:
 
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/stop_uam_sim.sh
-```
+- QGC nhận vehicle.
+- GPS/estimator/local position OK nếu bay ngoài trời hoặc flow/VIO/mocap nếu dùng trong nhà.ssh 
+- Battery OK.
+- RC/manual mode hoạt động.
+- Kill switch/failsafe đã test.
+- Propeller đúng chiều, frame đúng, motor test đúng thứ tự.
 
-## 3. Luồng chạy nhanh nhất
+**3. Arm và hover bằng PX4 internal**
+Trên QGC:
 
-### 3.1 Baseline hover với PX4 internal controller
-
-Đây là bước kiểm tra UAV có thể takeoff và hold ở khoảng 2 m trước khi bật external control.
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/run_qgc_baseline.py --controller-mode baseline
-```
-
-Hoặc dùng wrapper shell:
-
-```bash
-./tools/run_uam_qgc.sh baseline
-```
-
-Luồng này sẽ:
-
-- cleanup các tiến trình cũ
-- chạy `make px4_sitl gz_x500_hop`
-- chạy `ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true enable_rbfnn:=false`
-- tự khởi động bridge `gz_joint_state_bridge.py` để nối `/model/x500_hop_0/joint_state` sang `/joint_states`
-
-Thao tác bay:
-
-1. Mở QGroundControl.
+1. Chọn mode ổn định như `Position` hoặc `Altitude`, tùy sensor bạn có.
 2. Arm.
-3. Takeoff lên khoảng 2 m.
-4. Giữ hover ổn định với PX4 internal controller.
+3. Takeoff thấp trước, khoảng `0.5 m`.
+4. Nếu ổn, hover `1.5-2 m`.
+5. Không bật `/uam/enable_external_controller` ở bước này.
 
-## 4. Chuyển sang external backstepping + RBFNN
+Mục tiêu: xác nhận firmware + frame + sensor + motor + QGC bay ổn với controller PX4 gốc.
 
-Sau khi baseline hover ổn định, bật external mode bằng helper:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/run_qgc_baseline.py --controller-mode external --rbfnn-output-enable true
-```
-
-Hoặc:
+**4. Theo dõi trong lúc hover**
+Terminal Pi:
 
 ```bash
-./tools/run_uam_qgc.sh auto
+ros2 topic echo /uam/telemetry
 ```
 
-Các chế độ quan trọng:
-
-- `--controller-mode external`: bật `MC_RATE_EXT_EN=1`
-- `--rbfnn-output-enable false`: chỉ backstepping, chưa bật output RBFNN
-- `--rbfnn-output-enable true`: backstepping + RBFNN
-- `--external-handoff-mode manual|auto`: chọn chuyển tay hay tự chuyển sau hover ổn định
-- `--profile pitch_damped`: profile PX4 an toàn hơn khi takeoff còn rung hoặc pitch chưa ổn
-
-Nếu chạy manual, khi UAV đã hover ổn định, có thể gọi:
+Hoặc kiểm tra input/output PX4:
 
 ```bash
-source ~/ros2_ws/install/setup.bash
-ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
+ros2 topic hz /fmu/out/vehicle_odometry
+ros2 topic hz /fmu/out/vehicle_rates_setpoint
 ```
 
-Ghi nhớ:
+Nếu `/fmu/out/vehicle_rates_setpoint` có dữ liệu khi bay, ROS đã nhận được setpoint mà external rate controller sẽ bám sau này.
 
-- external controller chỉ nên bật sau khi hover ổn định
-- nếu node ROS chết hoặc topic stale, PX4 sẽ fallback về internal control
-- file launch `uam_qgc_mode.launch.py` là nhánh QGC, không dùng `uam_mission_bridge`
+**5. Hạ cánh và disarm**
+Dùng QGC Land hoặc điều khiển tay hạ xuống. Sau đó kiểm tra không có node crash.
 
-## 5. Kích hoạt cánh tay và tuning RBFNN
-
-Để test disturbance rejection của backstepping + RBFNN:
-
-### 5.1 Chạy case kiểm chứng có log
+**6. Chạy external ở mức an toàn nhất**
+Chỉ sau khi baseline hover ổn:
 
 ```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/run_uam_verification.sh internal_hover
-./tools/run_uam_verification.sh external_bs_hover
-./tools/run_uam_verification.sh external_rbfnn_hover
-./tools/run_uam_verification.sh external_rbfnn_arm_sin02
-./tools/run_uam_verification.sh external_rbfnn_arm_combined03
+ros2 launch uam_controller uam_qgc_mode.launch.py \
+  sim:=false \
+  start_xrce_agent:=true \
+  xrce_serial_dev:=/dev/ttyAMA0 \
+  xrce_baud:=921600 \
+  enable_rbfnn:=true \
+  rbfnn_output_enable:=false \
+  external_handoff_mode:=manual \
+  start_data_logger:=true \
+  experiment_output_root:=/home/piros2/uam_verification_logs
 ```
 
-Các case này lần lượt dùng để:
-
-- `internal_hover`: baseline PX4
-- `external_bs_hover`: external backstepping בלבד, chưa bật RBFNN
-- `external_rbfnn_hover`: external backstepping + RBFNN, arm fixed
-- `external_rbfnn_arm_sin02`: arm sin nhẹ với biên độ 0.2 rad
-- `external_rbfnn_arm_combined03`: arm excitation tổng hợp, biên độ 0.3 rad
-
-### 5.2 Ghi chú về handoff
-
-`run_uam_verification.sh` mặc định chờ tay. Sau khi hover ổn định 3 giây, bạn có thể:
-
-```bash
-source ~/ros2_ws/install/setup.bash
-ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
-```
-
-Các biến môi trường hữu ích:
-
-- `HANDOFF_MODE=manual|auto`
-- `HANDOFF_SETTLE_S=3`
-- `AUTO_ARM_AFTER_S=<seconds>`
-- `RESULTS_ROOT=/path/to/output`
-- `LOG_RATE_HZ=20.0`
-
-### 5.3 Kích arm để tạo nhiễu
-
-Trong giai đoạn tuning RBFNN, nên bắt đầu với arm fixed, rồi mới cho arm chuyển động nhẹ.
-
-Ví dụ:
-
-```bash
-source ~/ros2_ws/install/setup.bash
-ros2 run uam_controller arm_trajectory_generator.py --pattern sin --duration 120 --amplitude 0.2 --rate 10
-```
-
-Hoặc:
-
-```bash
-ros2 run uam_controller arm_trajectory_generator.py --pattern combined --duration 300 --amplitude 0.3 --rate 10
-```
-
-Lưu ý:
-
-- `arm_initial_pose.py` sẽ gập arm về tư thế an toàn khi sim khởi động
-- `arm_gazebo_command_node.py` đẩy lệnh khớp sang Gazebo
-- `rbfnn_data_logger.py` ghi log đủ để dùng cho báo cáo và phân tích
-
-## 6. Tuning PID baseline trước khi bật external
-
-Nếu cần chỉnh lại PX4 baseline trước khi qua external control:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-python3 tools/px4_pid_slider_tuner.py --autostart
-```
-
-Tuner này:
-
-- mở UI slider cho các tham số PX4
-- cho phép arm / disarm trực tiếp
-- lưu preset JSON trong `Tools/simulation/gz/pid_search_results/pid_slider_presets/`
-- copy được các dòng `param set-default ...`
-
-Tuning tự động có thể dùng:
-
-```bash
-python3 tools/px4_slider_autotune.py --trials 20 --stop-when-good
-```
-
-Khuyến nghị cho baseline:
-
-- tune trước khi bật external
-- ưu tiên ổn định hover 2 m
-- nếu đã có preset tốt, chỉ cần nạp lại preset đó trước khi chạy external experiments
-- nếu takeoff còn rung, thử thêm `--profile pitch_damped` ở `run_qgc_baseline.py` hoặc wrapper `run_uam_qgc.sh`
-
-## 7. Ghi log và phân tích kết quả
-
-Logger của thí nghiệm lưu dữ liệu dưới:
+Trên PX4 cần đảm bảo param custom đã bật cơ chế bypass, ví dụ:
 
 ```text
-Tools/simulation/gz/pid_search_results/uam_verification/<timestamp>_<case>/
+MC_RATE_EXT_EN = 1
 ```
 
-Trong thư mục đó thường có:
+Nếu param này chưa bật, ROS node có chạy nhưng PX4 vẫn dùng internal rate controller.
 
-- `flight_timeseries.csv`
-- `metadata.json`
-- `summary.json`
-- `summary.md`
-
-Để so sánh log PX4 native và log RBFNN:
+**7. Handoff thủ công**
+Sau khi UAV đã hover ổn định `1.8-2 m`, gọi:
 
 ```bash
-python3 tools/px4_uam_log_analyzer.py \
-  <px4_native_log.ulg> \
-  <rbfnn_custom_log.ulg> \
-  --output-dir px4_uam_log_analysis \
-  --nn-topic uam_debug \
-  --nn-fields n_hat[0],n_hat[1],n_hat[2]
+ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
 ```
 
-Script analyzer chấp nhận cả `.ulg/.ulog` lẫn `.csv`.
+Ban đầu dùng:
 
-Kết quả sinh ra:
-
-- đồ thị position response
-- đồ thị attitude response
-- đồ thị output RBFNN
-- bảng RMSE / max error trong `tracking_metrics.md`
-
-## 8. Kiểm tra topic quan trọng
-
-Các topic nên có trước khi tin rằng luồng external đã đúng:
-
-```bash
-ros2 topic echo /joint_states --once
-ros2 topic info /fmu/in/vehicle_torque_setpoint -v
-ros2 topic info /fmu/in/vehicle_thrust_setpoint -v
-ros2 topic echo /fmu/out/vehicle_status_v1 --once
-ros2 topic echo /fmu/out/vehicle_odometry --once
+```text
+rbfnn_output_enable:=false
 ```
 
-Nếu `/joint_states` không thay đổi khi arm cử động, hãy kiểm tra bridge `gz_joint_state_bridge.py`.
+tức là **Backstepping-only**, chưa cho RBFNN tác động. Khi Backstepping-only ổn mới thử:
 
-## 9. Cleanup và chạy lại
-
-Khi muốn dừng sạch toàn bộ PX4 / Gazebo / ROS2:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/stop_uam_sim.sh
+```text
+rbfnn_output_enable:=true
 ```
 
-Script này sẽ:
+**8. Trình tự tăng rủi ro**
+Đi theo cấp này:
 
-- gửi `SIGTERM` trước
-- chờ một khoảng thời gian
-- chỉ dùng `SIGKILL` nếu tiến trình vẫn còn sống
+1. PX4 internal hover, arm fixed.
+2. External Backstepping-only, arm fixed.
+3. External Backstepping + RBFNN, arm fixed.
+4. External Backstepping + RBFNN, arm chuyển động nhẹ.
+5. Tăng biên độ/chuyển động tay máy.
 
-## 10. Gợi ý thứ tự cho đồ án
-
-1. Tune PX4 baseline bằng `px4_pid_slider_tuner.py`.
-2. Chạy `internal_hover` để xác nhận UAV giữ được 2 m.
-3. Chạy `external_bs_hover` để xác nhận backstepping thay rate controller.
-4. Chạy `external_rbfnn_hover` với arm fixed.
-5. Chạy `external_rbfnn_arm_sin02` để bắt đầu tune RBFNN với disturbance nhẹ.
-6. Dùng `px4_uam_log_analyzer.py` để lấy số liệu và hình cho báo cáo.
+Không nhảy thẳng tới RBFNN + arm chuyển động.

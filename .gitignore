@@ -8,3 +8,5 @@ log/
 
 # cache
 *.db
+__pycache__/
+*.py[cod]

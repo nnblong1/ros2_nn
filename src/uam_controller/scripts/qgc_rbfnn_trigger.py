@@ -85,7 +85,8 @@ class QGCRBFNNTrigger(Node):
         self.vz = msg.velocity[2]
 
     def status_cb(self, msg):
-        armed = (msg.arming_state == 2)
+        armed_state = getattr(VehicleStatus, 'ARMING_STATE_ARMED', 2)
+        armed = (msg.arming_state == armed_state)
         if armed and not self.armed:
             self.arm_time = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().info('Vehicle armed. Waiting for stable hover before external-controller handoff.')

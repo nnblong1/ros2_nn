@@ -235,6 +235,7 @@ uam_mission_bridge:
   ros__parameters:
     cruise_speed: 2.0
     loop_rate_hz: 20.0
+    offboard_prime_duration_s: 1.5
     position_threshold: 0.25
     takeoff_height: -2.0
 uam_telemetry_monitor:
