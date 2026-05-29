@@ -15,9 +15,11 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import (
     VehicleStatus, 
     VehicleOdometry, 
+    VehicleLocalPosition,
     VehicleCommand,
     VehicleCommandAck,
     OffboardControlMode,
+    TimesyncStatus,
     TrajectorySetpoint
 )
 from std_msgs.msg import String, Bool
@@ -47,7 +49,9 @@ class UAMMissionBridge(Node):
         self.declare_parameter("cruise_speed", 2.0)
         self.declare_parameter("position_threshold", 0.25)
         self.declare_parameter("loop_rate_hz", 20.0)
-        self.declare_parameter("offboard_prime_duration_s", 1.5)
+        self.declare_parameter("offboard_prime_duration_s", 3.0)
+        self.declare_parameter("require_local_position_ready", True)
+        self.declare_parameter("auto_enable_external_controller", False)
 
         self.takeoff_height = self.get_parameter("takeoff_height").value
         self.cruise_speed   = self.get_parameter("cruise_speed").value
@@ -55,6 +59,8 @@ class UAMMissionBridge(Node):
         self.rate_hz        = self.get_parameter("loop_rate_hz").value
         self.offboard_prime_duration_s = self.get_parameter("offboard_prime_duration_s").value
         self.offboard_prime_ticks = max(1, int(math.ceil(self.offboard_prime_duration_s * self.rate_hz)))
+        self.require_local_position_ready = bool(self.get_parameter("require_local_position_ready").value)
+        self.auto_enable_external_controller = bool(self.get_parameter("auto_enable_external_controller").value)
 
         qos_reliable = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -78,7 +84,9 @@ class UAMMissionBridge(Node):
         # ── Subscribers ──
         self.sub_status = self.create_subscription(VehicleStatus, "/fmu/out/vehicle_status_v1", self._cb_status, qos_sensor)
         self.sub_odom   = self.create_subscription(VehicleOdometry, "/fmu/out/vehicle_odometry", self._cb_odom, qos_sensor)
+        self.sub_local_pos = self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position", self._cb_local_pos, qos_sensor)
         self.sub_cmd_ack = self.create_subscription(VehicleCommandAck, "/fmu/out/vehicle_command_ack", self._cb_vehicle_command_ack, qos_sensor)
+        self.sub_timesync = self.create_subscription(TimesyncStatus, "/fmu/out/timesync_status", self._cb_timesync, qos_sensor)
         self.sub_goto   = self.create_subscription(PoseStamped, "/uam/cmd/goto_pose", self._cb_goto_cmd, qos_reliable)
 
         # ── Services ──
@@ -97,7 +105,10 @@ class UAMMissionBridge(Node):
         
         self.state          = self.STATE_IDLE
         self.initialized    = False
+        self.has_local_pos  = False
+        self.local_position_ready = False
         self.px4_timestamp  = 0
+        self.px4_timestamp_ros_us = 0
         self.offboard_counter = 0
         self._prime_counter = 0
         self._takeoff_step = 0
@@ -118,14 +129,32 @@ class UAMMissionBridge(Node):
         self._update_px4_timestamp(msg.timestamp)
 
     def _cb_odom(self, msg: VehicleOdometry):
-        # Trực tiếp dùng NED từ Odometry để điều khiển hệ PX4
-        self.current_pos = np.array([msg.position[0], msg.position[1], msg.position[2]])
+        if not self.has_local_pos:
+            # Fallback NED từ Odometry nếu VehicleLocalPosition chưa sẵn sàng.
+            self.current_pos = np.array([msg.position[0], msg.position[1], msg.position[2]])
+            q = msg.q
+            siny = 2.0 * (q[0] * q[3] + q[1] * q[2])
+            cosy = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3])
+            self.current_yaw = math.atan2(siny, cosy)
+            self.initialized = True
         self._update_px4_timestamp(msg.timestamp)
-        q = msg.q
-        siny = 2.0 * (q[0] * q[3] + q[1] * q[2])
-        cosy = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3])
-        self.current_yaw = math.atan2(siny, cosy)
+
+    def _cb_local_pos(self, msg: VehicleLocalPosition):
+        self.current_pos = np.array([msg.x, msg.y, msg.z])
+        self.current_yaw = msg.heading
+        self.has_local_pos = True
+        self.local_position_ready = (
+            bool(msg.xy_valid)
+            and bool(msg.z_valid)
+            and bool(msg.v_xy_valid)
+            and bool(msg.v_z_valid)
+            and bool(msg.heading_good_for_control)
+        )
         self.initialized = True
+        self._update_px4_timestamp(msg.timestamp)
+
+    def _cb_timesync(self, msg: TimesyncStatus):
+        self._update_px4_timestamp(msg.timestamp)
 
     def _cb_vehicle_command_ack(self, msg: VehicleCommandAck):
         watched_commands = (
@@ -162,12 +191,21 @@ class UAMMissionBridge(Node):
             response.success = False
             response.message = "Chưa nhận /fmu/out/vehicle_odometry, không gửi lệnh Offboard/ARM sang PX4."
             return response
+        if self.require_local_position_ready and not self.local_position_ready:
+            response.success = False
+            response.message = (
+                "Local position/heading chưa sẵn sàng "
+                "(cần xy_valid, z_valid, v_xy_valid, v_z_valid, heading_good_for_control). "
+                "Không vào Offboard position takeoff."
+            )
+            return response
         if self.state != self.STATE_IDLE:
             response.success = False
             response.message = f"Đang ở trạng thái {self.state}"
             return response
 
         self.get_logger().info(f"🚀 Lệnh cất cánh nhận được. Đang chuẩn bị (NED Z={self.takeoff_height}m)...")
+        self._log_px4_input_links()
         
         # Lưu toạ độ hiện tại làm điểm bắt đầu
         self.setpoint     = np.array([self.current_pos[0], self.current_pos[1], self.current_pos[2]])
@@ -235,6 +273,7 @@ class UAMMissionBridge(Node):
 
         elif self.state == self.STATE_PRIME_OFFBOARD:
             self._publish_enable(False)
+            self._track_current_ground_setpoint()
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
             self._prime_counter += 1
 
@@ -255,6 +294,7 @@ class UAMMissionBridge(Node):
             
             # Step 0: Request OFFBOARD Mode
             if self._takeoff_step == 0:
+                self._track_current_ground_setpoint()
                 if self.vehicle_status.nav_state != VehicleStatus.NAVIGATION_STATE_OFFBOARD:
                     self._retry_timer += 1
                     if self._retry_timer % 20 == 1: # Once per second
@@ -272,6 +312,7 @@ class UAMMissionBridge(Node):
 
             # Step 1: Request ARM
             if self._takeoff_step == 1:
+                self._track_current_ground_setpoint()
                 if self.vehicle_status.arming_state != VehicleStatus.ARMING_STATE_ARMED:
                     self._retry_timer += 1
                     if self._retry_timer % 20 == 1:
@@ -290,9 +331,12 @@ class UAMMissionBridge(Node):
 
             if self._takeoff_step == 2:
                 # Chờ 2s cho động cơ khởi động mượt và áp lực đẩy
+                self._track_current_ground_setpoint()
                 self._takeoff_timer += 1
                 if self._takeoff_timer > 40: 
                     self.get_logger().info("🚀 3. Bắt đầu cất cánh (NED Z ramping)...")
+                    self.setpoint = self.current_pos.copy()
+                    self.setpoint_yaw = self.current_yaw
                     self._takeoff_step = 3
                 self._publish_setpoint(self.setpoint, self.setpoint_yaw)
                 return
@@ -317,11 +361,11 @@ class UAMMissionBridge(Node):
                 self._retry_timer = 0
 
         elif self.state == self.STATE_HOLD:
-            self._publish_enable(True)
+            self._publish_enable(self.auto_enable_external_controller)
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
 
         elif self.state == self.STATE_GOTO:
-            self._publish_enable(True)
+            self._publish_enable(self.auto_enable_external_controller)
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
             dist = np.linalg.norm(self.current_pos - self.setpoint)
             if dist < self.pos_threshold:
@@ -353,6 +397,10 @@ class UAMMissionBridge(Node):
         msg.source_component   = 1
         msg.from_external      = True
         self.pub_vehicle_cmd.publish(msg)
+        self.get_logger().info(
+            f"📤 Sent {self._vehicle_command_name(command)} "
+            f"(param1={float(param1):.1f}, param2={float(param2):.1f}, ts={msg.timestamp})"
+        )
 
     def _publish_offboard_mode(self):
         # ★ FIX #2 (Safety Doc): Trong Approach B, PHẢI giữ position=True.
@@ -383,6 +431,10 @@ class UAMMissionBridge(Node):
         msg.data = enable
         self.pub_enable.publish(msg)
 
+    def _track_current_ground_setpoint(self):
+        self.setpoint = self.current_pos.copy()
+        self.setpoint_yaw = self.current_yaw
+
     def _publish_state_str(self):
         state_info = {
             "mission_state": self.state,
@@ -398,13 +450,29 @@ class UAMMissionBridge(Node):
     def _update_px4_timestamp(self, timestamp: int):
         if timestamp:
             self.px4_timestamp = int(timestamp)
+            self.px4_timestamp_ros_us = self.get_clock().now().nanoseconds // 1000
 
     def _timestamp_us(self) -> int:
-        # PX4 expects timestamps in its boot-time clock domain. Using ROS wall time
-        # makes OffboardControlMode look stale/future-dated to commander.
-        if self.px4_timestamp:
+        # PX4 commander checks OffboardControlMode freshness in PX4 boot-time.
+        # Extrapolate from the last PX4 timestamp so outgoing setpoints do not
+        # look stale between odometry/status/timesync callbacks.
+        now_us = self.get_clock().now().nanoseconds // 1000
+        if self.px4_timestamp and self.px4_timestamp_ros_us:
+            elapsed_us = now_us - self.px4_timestamp_ros_us
+            if 0 <= elapsed_us < 5_000_000:
+                return int(self.px4_timestamp + elapsed_us)
             return int(self.px4_timestamp)
-        return self.get_clock().now().nanoseconds // 1000
+        return now_us
+
+    def _log_px4_input_links(self):
+        self.get_logger().info(
+            "PX4 input DDS matches: "
+            f"offboard={self.pub_offboard_mode.get_subscription_count()}, "
+            f"trajectory={self.pub_trajectory.get_subscription_count()}, "
+            f"vehicle_cmd={self.pub_vehicle_cmd.get_subscription_count()}"
+        )
+        if not self.px4_timestamp:
+            self.get_logger().warn("Chưa có PX4 timestamp từ status/odometry/timesync; Offboard có thể bị từ chối.")
 
     def _vehicle_command_name(self, command: int) -> str:
         names = {

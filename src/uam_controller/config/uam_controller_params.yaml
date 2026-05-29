@@ -234,9 +234,11 @@ uam_adaptive_controller:
 uam_mission_bridge:
   ros__parameters:
     cruise_speed: 2.0
+    auto_enable_external_controller: false
     loop_rate_hz: 20.0
-    offboard_prime_duration_s: 1.5
+    offboard_prime_duration_s: 3.0
     position_threshold: 0.25
+    require_local_position_ready: true
     takeoff_height: -2.0
 uam_telemetry_monitor:
   ros__parameters:

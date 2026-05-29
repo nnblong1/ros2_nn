@@ -26,23 +26,54 @@ Cách dùng:
   # Gazebo SITL
   ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true
 
-  # Phần cứng thật
-  ros2 launch uam_controller uam_qgc_mode.launch.py sim:=false xrce_serial_dev:=/dev/ttyACM0
+  # Phần cứng thật: XRCE-DDS phải đi qua TELEM2/UART riêng.
+  # Không dùng /dev/ttyACM0 vì đây là PX4 USB CDC cho MAVLink/QGC.
+  ros2 launch uam_controller uam_qgc_mode.launch.py sim:=false xrce_serial_dev:=/dev/serial0
 """
 
-import os
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     TimerAction,
     LogInfo,
+    OpaqueFunction,
 )
-from launch.conditions import IfCondition, UnlessCondition
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression, EnvironmentVariable
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+def _validate_hardware_serial_topology(context, *args, **kwargs):
+    del args, kwargs
+    sim = LaunchConfiguration('sim').perform(context).lower()
+    start_xrce_agent = LaunchConfiguration('start_xrce_agent').perform(context).lower()
+    xrce_serial_dev = LaunchConfiguration('xrce_serial_dev').perform(context)
+
+    if sim != 'false' or start_xrce_agent != 'true':
+        return []
+
+    if xrce_serial_dev.startswith('/dev/ttyACM'):
+        raise RuntimeError(
+            'Invalid MAVLink/XRCE topology: xrce_serial_dev is set to '
+            f'{xrce_serial_dev}. PX4 USB CDC /dev/ttyACM* must be reserved for '
+            'mavlink-routerd/QGC only. Use the TELEM2/UART device, normally '
+            '/dev/serial0 on Raspberry Pi, for MicroXRCEAgent, or set '
+            'start_xrce_agent:=false if the XRCE agent is already running on '
+            'the correct UART.'
+        )
+
+    if xrce_serial_dev in ('/dev/ttyAMA0', '/dev/serial1'):
+        raise RuntimeError(
+            'Invalid XRCE serial device for this hardware setup: '
+            f'xrce_serial_dev is set to {xrce_serial_dev}. This Pi maps '
+            '/dev/serial0 to the TELEM2 UART, while /dev/ttyAMA0 is '
+            '/dev/serial1. Use xrce_serial_dev:=/dev/serial0.'
+        )
+
+    return []
 
 
 def generate_launch_description():
@@ -117,8 +148,8 @@ def generate_launch_description():
 
     arg_xrce_serial_dev = DeclareLaunchArgument(
         'xrce_serial_dev',
-        default_value='/dev/ttyAMA0',
-        description='Thiết bị serial cho MicroXRCEAgent khi sim=false, ví dụ /dev/ttyAMA0, /dev/ttyUSB0, /dev/ttyACM0'
+        default_value='/dev/serial0',
+        description='Thiết bị TELEM2/UART cho MicroXRCEAgent khi sim=false. Trên Pi nên dùng /dev/serial0; không dùng PX4 USB CDC /dev/ttyACM*'
     )
 
     arg_xrce_baud = DeclareLaunchArgument(
@@ -139,6 +170,7 @@ def generate_launch_description():
     start_xrce_agent = LaunchConfiguration('start_xrce_agent')
     xrce_serial_dev = LaunchConfiguration('xrce_serial_dev')
     xrce_baud = LaunchConfiguration('xrce_baud')
+    validate_hardware_serial_topology = OpaqueFunction(function=_validate_hardware_serial_topology)
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 0 – Micro XRCE-DDS Agent
@@ -356,6 +388,7 @@ def generate_launch_description():
         arg_xrce_baud,
         # ── Hướng dẫn ──
         startup_info,
+        validate_hardware_serial_topology,
         # ── DDS Agent (khởi động ngay) ──
         xrce_hardware,
         xrce_sim,
