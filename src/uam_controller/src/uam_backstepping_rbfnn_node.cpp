@@ -112,6 +112,7 @@ void UAMAdaptiveController::declare_params() {
     declare_parameter("rbfnn_num_neurons", rbfnn_params_.num_neurons);
     declare_parameter("rbfnn_gaussian_width", rbfnn_params_.gaussian_width);
     declare_parameter("rbfnn_e_modification", rbfnn_params_.e_modification);
+    declare_parameter("rbfnn_output_gain", rbfnn_output_gain_);
 
     declare_parameter("rate_Kp_roll", rate_gains_.K_roll);
     declare_parameter("rate_Kp_pitch", rate_gains_.K_pitch);
@@ -143,6 +144,14 @@ void UAMAdaptiveController::declare_params() {
     declare_parameter("arm_ff_scale_yaw", arm_ff_scale_(2));
     declare_parameter("arm_ff_input_frame", arm_ff_input_frame_);
     declare_parameter("arm_ff_reaction_sign", arm_ff_reaction_sign_);
+    declare_parameter("arm_virtual_disturbance_enable", arm_virtual_disturbance_enabled_);
+    declare_parameter("arm_virtual_disturbance_max_roll_nm", 0.12);
+    declare_parameter("arm_virtual_disturbance_max_pitch_nm", 0.12);
+    declare_parameter("arm_virtual_disturbance_max_yaw_nm", 0.06);
+    declare_parameter("arm_virtual_disturbance_scale_roll", arm_virtual_disturbance_scale_(0));
+    declare_parameter("arm_virtual_disturbance_scale_pitch", arm_virtual_disturbance_scale_(1));
+    declare_parameter("arm_virtual_disturbance_scale_yaw", arm_virtual_disturbance_scale_(2));
+    declare_parameter("arm_virtual_disturbance_reaction_sign", arm_virtual_disturbance_reaction_sign_);
     declare_parameter("arm_cg_comp_enable", arm_cg_comp_enabled_);
     declare_parameter("arm_cg_roll_gain", arm_cg_roll_gain_);
     declare_parameter("arm_cg_pitch_gain", arm_cg_pitch_gain_);
@@ -163,13 +172,22 @@ void UAMAdaptiveController::declare_params() {
 
     // ★ FIX #1: Đọc rbfnn_lr từ YAML vào rbfnn_params_ TRƯỚC KHI khởi tạo RBFNN
     declare_parameter("rbfnn_lr", rbfnn_params_.learning_rate);
-    rbfnn_params_.num_neurons = get_parameter("rbfnn_num_neurons").as_int();
-    rbfnn_params_.input_dim = 6;
+    rbfnn_params_.num_neurons = std::max(12, static_cast<int>(get_parameter("rbfnn_num_neurons").as_int()));
+    rbfnn_params_.input_dim = RBFNN_INPUT_DIM;
     rbfnn_params_.output_dim = 3;
-    rbfnn_params_.learning_rate = get_parameter("rbfnn_lr").as_double();
-    rbfnn_params_.gaussian_width = get_parameter("rbfnn_gaussian_width").as_double();
-    rbfnn_params_.e_modification = get_parameter("rbfnn_e_modification").as_double();
-    RCLCPP_INFO(get_logger(), "RBFNN learning_rate loaded from YAML: %.5f", rbfnn_params_.learning_rate);
+    rbfnn_params_.learning_rate = std::clamp(get_parameter("rbfnn_lr").as_double(), 1.0e-5, 0.05);
+    rbfnn_params_.gaussian_width = std::clamp(get_parameter("rbfnn_gaussian_width").as_double(), 2.0, 6.0);
+    rbfnn_params_.e_modification = std::clamp(get_parameter("rbfnn_e_modification").as_double(), 0.0, 0.2);
+    rbfnn_output_gain_ = std::clamp(get_parameter("rbfnn_output_gain").as_double(), 0.0, 1.0);
+    RCLCPP_INFO(
+        get_logger(),
+        "RBFNN params: input_dim=%d, neurons=%d, lr=%.5f, width=%.3f, e_mod=%.4f, output_gain=%.3f",
+        rbfnn_params_.input_dim,
+        rbfnn_params_.num_neurons,
+        rbfnn_params_.learning_rate,
+        rbfnn_params_.gaussian_width,
+        rbfnn_params_.e_modification,
+        rbfnn_output_gain_);
 
     rate_gains_.K_roll  = get_parameter("rate_Kp_roll").as_double();
     rate_gains_.K_pitch = get_parameter("rate_Kp_pitch").as_double();
@@ -199,6 +217,15 @@ void UAMAdaptiveController::declare_params() {
     arm_ff_scale_(2) = std::clamp(get_parameter("arm_ff_scale_yaw").as_double(), -1.5, 1.5);
     arm_ff_input_frame_ = get_parameter("arm_ff_input_frame").as_string();
     arm_ff_reaction_sign_ = get_parameter("arm_ff_reaction_sign").as_double() < 0.0 ? -1.0 : 1.0;
+    arm_virtual_disturbance_enabled_ = get_parameter("arm_virtual_disturbance_enable").as_bool();
+    arm_virtual_disturbance_limit_(0) = std::abs(get_parameter("arm_virtual_disturbance_max_roll_nm").as_double());
+    arm_virtual_disturbance_limit_(1) = std::abs(get_parameter("arm_virtual_disturbance_max_pitch_nm").as_double());
+    arm_virtual_disturbance_limit_(2) = std::abs(get_parameter("arm_virtual_disturbance_max_yaw_nm").as_double());
+    arm_virtual_disturbance_scale_(0) = std::clamp(get_parameter("arm_virtual_disturbance_scale_roll").as_double(), -3.0, 3.0);
+    arm_virtual_disturbance_scale_(1) = std::clamp(get_parameter("arm_virtual_disturbance_scale_pitch").as_double(), -3.0, 3.0);
+    arm_virtual_disturbance_scale_(2) = std::clamp(get_parameter("arm_virtual_disturbance_scale_yaw").as_double(), -3.0, 3.0);
+    arm_virtual_disturbance_reaction_sign_ =
+        get_parameter("arm_virtual_disturbance_reaction_sign").as_double() < 0.0 ? -1.0 : 1.0;
     arm_cg_comp_enabled_ = get_parameter("arm_cg_comp_enable").as_bool();
     arm_cg_roll_gain_ = get_parameter("arm_cg_roll_gain").as_double();
     arm_cg_pitch_gain_ = get_parameter("arm_cg_pitch_gain").as_double();
@@ -289,10 +316,18 @@ void UAMAdaptiveController::arm_wrench_cb(const geometry_msgs::msg::WrenchStampe
         raw_tau = tau_msg;
     }
 
-    raw_tau *= arm_ff_reaction_sign_;
-    raw_tau = arm_ff_scale_.cwiseProduct(raw_tau);
-    raw_tau = sat_vec(raw_tau, arm_ff_limit_);
-    tau_arm_ff_target_ = arm_ff_lpf_alpha_ * raw_tau + (1.0 - arm_ff_lpf_alpha_) * tau_arm_ff_target_;
+    Eigen::Vector3d ff_tau = arm_ff_reaction_sign_ * raw_tau;
+    ff_tau = arm_ff_scale_.cwiseProduct(ff_tau);
+    ff_tau = sat_vec(ff_tau, arm_ff_limit_);
+    tau_arm_ff_target_ = arm_ff_lpf_alpha_ * ff_tau + (1.0 - arm_ff_lpf_alpha_) * tau_arm_ff_target_;
+
+    Eigen::Vector3d disturbance_tau = arm_virtual_disturbance_reaction_sign_ * raw_tau;
+    disturbance_tau = arm_virtual_disturbance_scale_.cwiseProduct(disturbance_tau);
+    disturbance_tau = sat_vec(disturbance_tau, arm_virtual_disturbance_limit_);
+    tau_arm_virtual_disturbance_target_ =
+        arm_ff_lpf_alpha_ * disturbance_tau
+        + (1.0 - arm_ff_lpf_alpha_) * tau_arm_virtual_disturbance_target_;
+
     last_arm_wrench_rx_time_ = get_clock()->now().seconds();
     has_arm_wrench_ = true;
 }
@@ -309,6 +344,8 @@ void UAMAdaptiveController::enable_cb(const std_msgs::msg::Bool::SharedPtr msg) 
         n_hat_.setZero();
         tau_arm_ff_.setZero();
         tau_arm_ff_target_.setZero();
+        tau_arm_virtual_disturbance_.setZero();
+        tau_arm_virtual_disturbance_target_.setZero();
         arm_cg_bias_norm_.setZero();
     } else if (!msg->data && controller_enabled_) {
         RCLCPP_INFO(get_logger(), "Rate Controller DISABLED. PX4 internal rate controller fallback remains active.");
@@ -320,6 +357,8 @@ void UAMAdaptiveController::enable_cb(const std_msgs::msg::Bool::SharedPtr msg) 
         n_hat_.setZero();
         tau_arm_ff_.setZero();
         tau_arm_ff_target_.setZero();
+        tau_arm_virtual_disturbance_.setZero();
+        tau_arm_virtual_disturbance_target_.setZero();
         arm_cg_bias_norm_.setZero();
     }
     controller_enabled_ = msg->data;
@@ -332,7 +371,7 @@ bool UAMAdaptiveController::inputs_fresh(double now) const {
 }
 
 bool UAMAdaptiveController::arm_ff_fresh(double now) const {
-    if (!arm_ff_enabled_) return true;
+    if (!arm_ff_enabled_ && !arm_virtual_disturbance_enabled_) return true;
     return has_arm_wrench_
         && last_arm_wrench_rx_time_ > 0.0
         && (now - last_arm_wrench_rx_time_) < arm_ff_timeout_s_;
@@ -390,6 +429,26 @@ void UAMAdaptiveController::update_arm_feedforward(
     tau_arm_ff_ = rate_limit_vec(tau_arm_ff_, target, max_delta);
 }
 
+void UAMAdaptiveController::update_arm_virtual_disturbance(
+    double elapsed_since_enable,
+    double dt,
+    bool takeoff_sensitive)
+{
+    Eigen::Vector3d target = Eigen::Vector3d::Zero();
+
+    if (arm_virtual_disturbance_enabled_ && has_arm_wrench_ && !takeoff_sensitive) {
+        const double ramp = std::clamp(
+            (elapsed_since_enable - arm_ff_start_delay_s_) / arm_ff_ramp_s_,
+            0.0,
+            1.0);
+        target = ramp * tau_arm_virtual_disturbance_target_;
+    }
+
+    const double max_delta = arm_ff_rate_limit_nm_s_ * dt;
+    tau_arm_virtual_disturbance_ =
+        rate_limit_vec(tau_arm_virtual_disturbance_, target, max_delta);
+}
+
 void UAMAdaptiveController::update_arm_cg_bias()
 {
     Eigen::Vector2d target = Eigen::Vector2d::Zero();
@@ -413,6 +472,39 @@ void UAMAdaptiveController::update_arm_cg_bias()
 
     arm_cg_bias_norm_ =
         arm_cg_lpf_alpha_ * target + (1.0 - arm_cg_lpf_alpha_) * arm_cg_bias_norm_;
+}
+
+Eigen::VectorXd UAMAdaptiveController::build_rbfnn_input() const
+{
+    Eigen::VectorXd Z = Eigen::VectorXd::Zero(RBFNN_INPUT_DIM);
+    int idx = 0;
+
+    auto push_scaled = [&](double value, double scale) {
+        if (idx >= RBFNN_INPUT_DIM) return;
+        const double denom = std::max(std::abs(scale), 1.0e-6);
+        Z(idx++) = sat(value / denom, 1.0);
+    };
+
+    for (int i = 0; i < 3; ++i) push_scaled(omega_(i), 1.0);       // rad/s
+    for (int i = 0; i < 3; ++i) push_scaled(e_omega_(i), 1.0);     // rad/s
+    for (int i = 0; i < N_JOINTS; ++i) push_scaled(q_[i], 1.0);    // rad
+    for (int i = 0; i < N_JOINTS; ++i) push_scaled(dq_[i], 1.0);   // rad/s
+
+    const Eigen::Vector3d residual_tau = tau_arm_virtual_disturbance_ - tau_arm_ff_;
+    for (int i = 0; i < 3; ++i) push_scaled(residual_tau(i), std::max(arm_virtual_disturbance_limit_(i), 1.0e-3));
+
+    return Z;
+}
+
+bool UAMAdaptiveController::rbfnn_ready(bool takeoff_sensitive, double now) const
+{
+    return rbfnn_output_enabled_
+        && !takeoff_sensitive
+        && has_joints_
+        && has_arm_wrench_
+        && arm_virtual_disturbance_enabled_
+        && arm_ff_fresh(now)
+        && tau_arm_virtual_disturbance_.norm() > 1.0e-4;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -442,15 +534,16 @@ void UAMAdaptiveController::control_loop() {
         // 1. Tính toán Sai số (Error) LUÔN CHẠY
         e_omega_ = omega_ - omega_des_;
 
-        // 2. ★ RBFNN RAMP-UP STRATEGY: Luôn học, output tăng dần
-        //    Thay vì tắt cứng khi takeoff, RBFNN luôn cập nhật trọng số.
-        //    Output bị clamp theo thời gian để đảm bảo an toàn.
-        {
-            Eigen::VectorXd Z(6);
-            Z << omega_, e_omega_;
+        update_arm_feedforward(elapsed, dt, takeoff_sensitive);
+        update_arm_virtual_disturbance(elapsed, dt, takeoff_sensitive);
+        update_arm_cg_bias();
 
-            // LUÔN cập nhật trọng số (học từ giây đầu tiên)
-            if (rbfnn_output_enabled_) {
+        // 2. RBFNN residual compensation. Chỉ học/xuất khi nhiễu cánh tay ảo
+        //    đã active để tránh học bias hover và gây drift XY.
+        {
+            Eigen::VectorXd Z = build_rbfnn_input();
+
+            if (rbfnn_ready(takeoff_sensitive, now)) {
                 rbfnn_->update_weights(Z, e_omega_, dt);
 
                 // Xác định mức clamp theo thời gian (Ramp-up), đơn vị rad/s^2
@@ -464,9 +557,9 @@ void UAMAdaptiveController::control_loop() {
                 }
 
                 Eigen::VectorXd n_est = rbfnn_->estimate(Z);
-                n_hat_(0) = sat(n_est(0), rbfnn_clamp);
-                n_hat_(1) = sat(n_est(1), rbfnn_clamp);
-                n_hat_(2) = sat(n_est(2), rbfnn_clamp);
+                n_hat_(0) = rbfnn_output_gain_ * sat(n_est(0), rbfnn_clamp);
+                n_hat_(1) = rbfnn_output_gain_ * sat(n_est(1), rbfnn_clamp);
+                n_hat_(2) = rbfnn_output_gain_ * sat(n_est(2), rbfnn_clamp);
             } else {
                 n_hat_.setZero();
             }
@@ -498,11 +591,13 @@ void UAMAdaptiveController::control_loop() {
         e_omega_int_ += e_omega_ * dt;
         e_omega_int_ = e_omega_int_.cwiseMax(-int_clamp).cwiseMin(int_clamp);
 
-        update_arm_feedforward(elapsed, dt, takeoff_sensitive);
-        update_arm_cg_bias();
-
-        const Eigen::Vector3d tau_arm = arm_ff_enabled_ ? tau_arm_ff_ : Eigen::Vector3d::Zero();
-        tau = J_mat * (-Kp_mat * e_omega_ - Ki_mat * e_omega_int_ - Kd_mat * e_omega_dot - n_hat_) + coriolis - tau_arm;
+        const Eigen::Vector3d tau_arm_comp = arm_ff_enabled_ ? tau_arm_ff_ : Eigen::Vector3d::Zero();
+        const Eigen::Vector3d tau_arm_disturbance =
+            arm_virtual_disturbance_enabled_ ? tau_arm_virtual_disturbance_ : Eigen::Vector3d::Zero();
+        tau = J_mat * (-Kp_mat * e_omega_ - Ki_mat * e_omega_int_ - Kd_mat * e_omega_dot - n_hat_)
+              + coriolis
+              + tau_arm_disturbance
+              - tau_arm_comp;
         e_omega_prev_ = e_omega_;
 
         // Normalized Torque for PX4
@@ -573,6 +668,12 @@ void UAMAdaptiveController::control_loop() {
     dbg.data.insert(dbg.data.end(), {tau_norm(0), tau_norm(1), tau_norm(2)});
     dbg.data.push_back(arm_ff_enabled_ ? 1.0 : 0.0);
     dbg.data.push_back(arm_ff_fresh(now) ? 1.0 : 0.0);
+    dbg.data.insert(dbg.data.end(), {
+        tau_arm_virtual_disturbance_(0),
+        tau_arm_virtual_disturbance_(1),
+        tau_arm_virtual_disturbance_(2)
+    });
+    dbg.data.push_back(arm_virtual_disturbance_enabled_ ? 1.0 : 0.0);
     debug_pub_->publish(dbg);
 }
 

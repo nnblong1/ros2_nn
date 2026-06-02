@@ -210,6 +210,18 @@ class RBFNNDataLogger(Node):
             "dbg_tau_x": math.nan,
             "dbg_tau_y": math.nan,
             "dbg_tau_z": math.nan,
+            "dbg_tau_arm_ff_x": math.nan,
+            "dbg_tau_arm_ff_y": math.nan,
+            "dbg_tau_arm_ff_z": math.nan,
+            "dbg_tau_norm_x": math.nan,
+            "dbg_tau_norm_y": math.nan,
+            "dbg_tau_norm_z": math.nan,
+            "dbg_arm_ff_enabled": False,
+            "dbg_arm_ff_fresh": False,
+            "dbg_tau_arm_disturbance_x": math.nan,
+            "dbg_tau_arm_disturbance_y": math.nan,
+            "dbg_tau_arm_disturbance_z": math.nan,
+            "dbg_arm_virtual_disturbance_enabled": False,
             "controller_enabled": False,
             "landed": True,
             "armed": False,
@@ -278,6 +290,18 @@ class RBFNNDataLogger(Node):
             "dbg_tau_x",
             "dbg_tau_y",
             "dbg_tau_z",
+            "dbg_tau_arm_ff_x",
+            "dbg_tau_arm_ff_y",
+            "dbg_tau_arm_ff_z",
+            "dbg_tau_norm_x",
+            "dbg_tau_norm_y",
+            "dbg_tau_norm_z",
+            "dbg_arm_ff_enabled",
+            "dbg_arm_ff_fresh",
+            "dbg_tau_arm_disturbance_x",
+            "dbg_tau_arm_disturbance_y",
+            "dbg_tau_arm_disturbance_z",
+            "dbg_arm_virtual_disturbance_enabled",
         ]
         self.headers.extend([f"joint_pos_{idx + 1}" for idx in range(N_JOINTS)])
         self.headers.extend([f"joint_vel_{idx + 1}" for idx in range(N_JOINTS)])
@@ -372,7 +396,13 @@ class RBFNNDataLogger(Node):
                 "3_5": "omega_des desired body rates",
                 "6_8": "e_omega rate error",
                 "9_11": "n_hat RBFNN compensation estimate",
-                "12_14": "tau commanded normalized torque",
+                "12_14": "tau commanded torque before normalization [Nm]",
+                "15_17": "tau_arm_ff compensation torque [Nm]",
+                "18_20": "tau_norm sent to PX4 before saturation",
+                "21": "arm_ff_enabled",
+                "22": "arm_ff_fresh",
+                "23_25": "tau_arm_virtual_disturbance injected into simulated plant [Nm]",
+                "26": "arm_virtual_disturbance_enabled",
             },
         }
         self.metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -463,6 +493,28 @@ class RBFNNDataLogger(Node):
                     "dbg_tau_x": finite(data[12]),
                     "dbg_tau_y": finite(data[13]),
                     "dbg_tau_z": finite(data[14]),
+                }
+            )
+        if len(data) >= 23:
+            self.state.update(
+                {
+                    "dbg_tau_arm_ff_x": finite(data[15]),
+                    "dbg_tau_arm_ff_y": finite(data[16]),
+                    "dbg_tau_arm_ff_z": finite(data[17]),
+                    "dbg_tau_norm_x": finite(data[18]),
+                    "dbg_tau_norm_y": finite(data[19]),
+                    "dbg_tau_norm_z": finite(data[20]),
+                    "dbg_arm_ff_enabled": bool(finite(data[21]) > 0.5),
+                    "dbg_arm_ff_fresh": bool(finite(data[22]) > 0.5),
+                }
+            )
+        if len(data) >= 27:
+            self.state.update(
+                {
+                    "dbg_tau_arm_disturbance_x": finite(data[23]),
+                    "dbg_tau_arm_disturbance_y": finite(data[24]),
+                    "dbg_tau_arm_disturbance_z": finite(data[25]),
+                    "dbg_arm_virtual_disturbance_enabled": bool(finite(data[26]) > 0.5),
                 }
             )
 
@@ -619,6 +671,34 @@ class RBFNNDataLogger(Node):
         n_hat_norm = self._vector_norms(
             analysis, ("dbg_n_hat_x", "dbg_n_hat_y", "dbg_n_hat_z")
         )
+        tau_arm_ff_norm = self._vector_norms(
+            analysis, ("dbg_tau_arm_ff_x", "dbg_tau_arm_ff_y", "dbg_tau_arm_ff_z")
+        )
+        tau_arm_disturbance_norm = self._vector_norms(
+            analysis,
+            (
+                "dbg_tau_arm_disturbance_x",
+                "dbg_tau_arm_disturbance_y",
+                "dbg_tau_arm_disturbance_z",
+            ),
+        )
+        tau_residual_norm: list[float] = []
+        ff_disturbance_dot: list[float] = []
+        for sample in analysis:
+            ff = [
+                finite(sample.get("dbg_tau_arm_ff_x", math.nan)),
+                finite(sample.get("dbg_tau_arm_ff_y", math.nan)),
+                finite(sample.get("dbg_tau_arm_ff_z", math.nan)),
+            ]
+            disturbance = [
+                finite(sample.get("dbg_tau_arm_disturbance_x", math.nan)),
+                finite(sample.get("dbg_tau_arm_disturbance_y", math.nan)),
+                finite(sample.get("dbg_tau_arm_disturbance_z", math.nan)),
+            ]
+            if all(math.isfinite(v) for v in ff + disturbance):
+                residual = [disturbance[idx] - ff[idx] for idx in range(N_AXES)]
+                tau_residual_norm.append(math.sqrt(sum(v * v for v in residual)))
+                ff_disturbance_dot.append(sum(disturbance[idx] * ff[idx] for idx in range(N_AXES)))
         joint_cmd_norm = self._vector_norms(
             analysis, tuple(f"joint_cmd_{idx}" for idx in range(1, N_JOINTS + 1))
         )
@@ -686,6 +766,25 @@ class RBFNNDataLogger(Node):
                 "torque_norm_max": maximum(torque_norm),
                 "n_hat_norm_rms": rms(n_hat_norm),
                 "n_hat_norm_max": maximum(n_hat_norm),
+                "tau_arm_ff_norm_rms_nm": rms(tau_arm_ff_norm),
+                "tau_arm_ff_norm_max_nm": maximum(tau_arm_ff_norm),
+                "tau_arm_disturbance_norm_rms_nm": rms(tau_arm_disturbance_norm),
+                "tau_arm_disturbance_norm_max_nm": maximum(tau_arm_disturbance_norm),
+                "tau_residual_norm_rms_nm": rms(tau_residual_norm),
+                "tau_residual_norm_max_nm": maximum(tau_residual_norm),
+                "ff_disturbance_dot_mean": mean(ff_disturbance_dot),
+                "arm_ff_enabled_fraction": (
+                    sum(1 for s in analysis if bool(s.get("dbg_arm_ff_enabled", False))) / len(analysis)
+                    if analysis else math.nan
+                ),
+                "arm_ff_fresh_fraction": (
+                    sum(1 for s in analysis if bool(s.get("dbg_arm_ff_fresh", False))) / len(analysis)
+                    if analysis else math.nan
+                ),
+                "arm_virtual_disturbance_enabled_fraction": (
+                    sum(1 for s in analysis if bool(s.get("dbg_arm_virtual_disturbance_enabled", False))) / len(analysis)
+                    if analysis else math.nan
+                ),
             },
             "arm_motion": {
                 "joint_cmd_norm_rms_rad": rms(joint_cmd_norm),
@@ -761,6 +860,12 @@ class RBFNNDataLogger(Node):
             f"- Rate error norm RMS/max: {fmt(rate['e_omega_norm_rms_radps'])} / {fmt(rate['e_omega_norm_max_radps'])} rad/s",
             f"- Torque norm RMS/max: {fmt(ext['torque_norm_rms'])} / {fmt(ext['torque_norm_max'])}",
             f"- RBFNN n_hat norm RMS/max: {fmt(ext['n_hat_norm_rms'])} / {fmt(ext['n_hat_norm_max'])}",
+            f"- Arm FF torque norm RMS/max: {fmt(ext['tau_arm_ff_norm_rms_nm'])} / {fmt(ext['tau_arm_ff_norm_max_nm'])} Nm",
+            f"- Virtual arm disturbance norm RMS/max: {fmt(ext['tau_arm_disturbance_norm_rms_nm'])} / {fmt(ext['tau_arm_disturbance_norm_max_nm'])} Nm",
+            f"- Arm residual torque norm RMS/max: {fmt(ext['tau_residual_norm_rms_nm'])} / {fmt(ext['tau_residual_norm_max_nm'])} Nm",
+            f"- Arm FF/disturbance dot mean: {fmt(ext['ff_disturbance_dot_mean'], 6)}",
+            f"- Arm FF enabled/fresh fraction: {fmt(ext['arm_ff_enabled_fraction'], 4)} / {fmt(ext['arm_ff_fresh_fraction'], 4)}",
+            f"- Virtual disturbance enabled fraction: {fmt(ext['arm_virtual_disturbance_enabled_fraction'], 4)}",
             "",
             "## Arm Motion",
             "",

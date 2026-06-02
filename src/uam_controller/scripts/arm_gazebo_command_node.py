@@ -44,6 +44,7 @@ class ArmGazeboCommandNode(Node):
         'Revolute_20', 'Revolute_22', 'Revolute_23',
         'Revolute_26', 'Revolute_28', 'Revolute_30'
     ]
+    ROS_JOINT_NAMES = [f'Joint_{i}' for i in range(1, 7)]
 
     def __init__(self):
         super().__init__('arm_gazebo_command_node')
@@ -51,12 +52,15 @@ class ArmGazeboCommandNode(Node):
         # Match x500_hop/model.sdf JointPositionController topics.
         self.declare_parameter('model_prefix', 'model/x500_hop')
         self.declare_parameter('command_topic', '/arm_controller/joint_trajectory_plan')
+        self.declare_parameter('state_topic', '/joint_states')
         self.declare_parameter('hold_publish_rate_hz', 20.0)
         self.declare_parameter('subprocess_pulse_period_s', 0.5)
         prefix = self.get_parameter('model_prefix') \
                      .get_parameter_value().string_value
         self.command_topic = self.get_parameter('command_topic') \
                                  .get_parameter_value().string_value
+        self.state_topic = self.get_parameter('state_topic') \
+                               .get_parameter_value().string_value
         self.hold_publish_rate_hz = max(
             1.0,
             self.get_parameter('hold_publish_rate_hz').get_parameter_value().double_value,
@@ -86,12 +90,35 @@ class ArmGazeboCommandNode(Node):
         self._command_count = 0
         self._last_info_log = 0.0
         self._last_subprocess_pulse = 0.0
+        self._name_to_index = {}
+        for i, (ros_name, sdf_name) in enumerate(zip(self.ROS_JOINT_NAMES, self.JOINT_NAMES)):
+            joint_num = i + 1
+            for alias in (
+                ros_name,
+                ros_name.lower(),
+                ros_name.replace('_', ' '),
+                ros_name.replace('_', ' ').lower(),
+                f'joint{joint_num}',
+                f'joint_{joint_num}',
+                f'joint {joint_num}',
+                f'j{joint_num}',
+                str(joint_num),
+                sdf_name,
+                sdf_name.lower(),
+            ):
+                self._name_to_index[alias] = i
 
         # Subscribe lệnh trajectory plan (ROS 2)
         self.sub_joint_plan = self.create_subscription(
             JointState,
             self.command_topic,
             self._on_joint_plan,
+            10,
+        )
+        self.sub_joint_state = self.create_subscription(
+            JointState,
+            self.state_topic,
+            self._on_joint_state,
             10,
         )
         self.hold_timer = self.create_timer(
@@ -103,6 +130,7 @@ class ArmGazeboCommandNode(Node):
             f'Arm Gazebo Command Node started | '
             f'method={"gz-transport" if GZ_TRANSPORT_OK else "subprocess"} | '
             f'command_topic={self.command_topic} | '
+            f'state_topic={self.state_topic} | '
             f'hold_rate={self.hold_publish_rate_hz:.1f}Hz | '
             f'subprocess_pulse={self.subprocess_pulse_period_s:.2f}s'
         )
@@ -177,15 +205,46 @@ class ArmGazeboCommandNode(Node):
         self._publish_to_gazebo(self._last_positions)
 
     # ──────────────── Callback chính ────────────────
-    def _on_joint_plan(self, msg: JointState):
+    def _on_joint_state(self, msg: JointState):
+        if self._have_command:
+            return
+        positions = self._positions_from_named_msg(msg, self._last_positions)
+        if positions is not None:
+            self._last_positions = positions
+
+    def _positions_from_named_msg(self, msg: JointState, base_positions):
         num_expected = len(self.JOINT_NAMES)
-        if len(msg.position) < num_expected:
-            self.get_logger().warn(
-                f'JointState chỉ có {len(msg.position)} phần tử, cần {num_expected}'
-            )
+        if msg.name:
+            positions = list(base_positions)
+            updated = 0
+            for name, pos in zip(msg.name, msg.position):
+                idx = self._name_to_index.get(name)
+                if idx is None:
+                    idx = self._name_to_index.get(name.lower())
+                if idx is None:
+                    self.get_logger().warn(f'Bỏ qua joint name không biết: {name}')
+                    continue
+                positions[idx] = float(pos)
+                updated += 1
+            if updated == 0:
+                return None
+            return positions
+
+        if len(msg.position) >= num_expected:
+            return [float(p) for p in msg.position[:num_expected]]
+
+        self.get_logger().warn(
+            f'JointState không có name và chỉ có {len(msg.position)} position, '
+            f'cần {num_expected} phần tử nếu dùng lệnh không tên.'
+        )
+        return None
+
+    def _on_joint_plan(self, msg: JointState):
+        positions = self._positions_from_named_msg(msg, self._last_positions)
+        if positions is None:
             return
 
-        self._last_positions = [float(p) for p in msg.position[:num_expected]]
+        self._last_positions = positions
         self._have_command = True
         self._command_count += 1
         self._publish_to_gazebo(

@@ -175,11 +175,11 @@ arm_dynamics_node:
     joint_acc_limit_radps2: 25.0
 uam_adaptive_controller:
   ros__parameters:
-    Ixx: 0.0498920943
-    Iyy: 0.0530802134
-    Izz: 0.023633241
-    Ixy: 0.0000031976
-    Ixz: -0.0021257404
+    Ixx: 0.0499520044
+    Iyy: 0.0531138089
+    Izz: 0.0237241960
+    Ixy: -0.0000251976
+    Ixz: 0.0021257404
     Iyz: 0.0002444194
     alt_Kd: 3.5
     alt_Ki: 1.0
@@ -210,7 +210,11 @@ uam_adaptive_controller:
     rate_Kp_roll: 0.09
     rate_Kp_yaw: 0.055
     rbfnn_enable: true
-    rbfnn_lr: 0.01
+    rbfnn_num_neurons: 45
+    rbfnn_lr: 0.004
+    rbfnn_gaussian_width: 3.0
+    rbfnn_e_modification: 0.035
+    rbfnn_output_gain: 0.5
     arm_ff_enable: false
     arm_ff_start_delay_s: 1.0
     arm_ff_ramp_s: 5.0
@@ -225,6 +229,14 @@ uam_adaptive_controller:
     arm_ff_scale_roll: 0.0
     arm_ff_scale_pitch: 0.0
     arm_ff_scale_yaw: 0.0
+    arm_virtual_disturbance_enable: false
+    arm_virtual_disturbance_max_roll_nm: 0.12
+    arm_virtual_disturbance_max_pitch_nm: 0.12
+    arm_virtual_disturbance_max_yaw_nm: 0.06
+    arm_virtual_disturbance_scale_roll: 1.0
+    arm_virtual_disturbance_scale_pitch: 1.0
+    arm_virtual_disturbance_scale_yaw: 1.0
+    arm_virtual_disturbance_reaction_sign: 1.0
     arm_cg_comp_enable: false
     arm_cg_roll_gain: 0.0
     arm_cg_pitch_gain: 0.0

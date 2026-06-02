@@ -26,54 +26,48 @@ Cách dùng:
   # Gazebo SITL
   ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true
 
-  # Phần cứng thật: XRCE-DDS phải đi qua TELEM2/UART riêng.
-  # Không dùng /dev/ttyACM0 vì đây là PX4 USB CDC cho MAVLink/QGC.
-  ros2 launch uam_controller uam_qgc_mode.launch.py sim:=false xrce_serial_dev:=/dev/serial0
+  # Gazebo SITL với file YAML tùy chọn
+  ros2 launch uam_controller uam_qgc_mode.launch.py \
+    sim:=true \
+    config_file:=/home/wicom/ros2_ws/src/uam_controller/config/uam_controller_params.yaml
+
+  # Chạy một YAML đã tune xong từ best-param-search
+  ros2 launch uam_controller uam_qgc_mode.launch.py \
+    sim:=true \
+    config_file:=/home/wicom/uam_results/rbfnn_best_param_search_<timestamp>/final_best_uam_controller_params.yaml \
+    arm_ff_enable:=true
+
+  # Backstepping-only với YAML tùy chọn, không dùng output RBFNN
+  ros2 launch uam_controller uam_qgc_mode.launch.py \
+    sim:=true \
+    config_file:=/path/to/custom_uam_controller_params.yaml \
+    rbfnn_output_enable:=false
+
+  Lưu ý:
+  - config_file phải là đường dẫn tuyệt đối hoặc đường dẫn mà shell hiện tại resolve được.
+  - YAML cần giữ đúng node keys: arm_dynamics_node.ros__parameters và
+    uam_adaptive_controller.ros__parameters.
+  - Nếu YAML nằm trong src sau khi sửa code/package, build lại rồi source workspace:
+    colcon build --packages-select uam_controller
+    source /home/wicom/ros2_ws/install/setup.bash
+
+  # Phần cứng thật
+  ros2 launch uam_controller uam_qgc_mode.launch.py sim:=false xrce_serial_dev:=/dev/ttyACM0
 """
 
+import os
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     TimerAction,
     LogInfo,
-    OpaqueFunction,
 )
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression, EnvironmentVariable
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
-
-
-def _validate_hardware_serial_topology(context, *args, **kwargs):
-    del args, kwargs
-    sim = LaunchConfiguration('sim').perform(context).lower()
-    start_xrce_agent = LaunchConfiguration('start_xrce_agent').perform(context).lower()
-    xrce_serial_dev = LaunchConfiguration('xrce_serial_dev').perform(context)
-
-    if sim != 'false' or start_xrce_agent != 'true':
-        return []
-
-    if xrce_serial_dev.startswith('/dev/ttyACM'):
-        raise RuntimeError(
-            'Invalid MAVLink/XRCE topology: xrce_serial_dev is set to '
-            f'{xrce_serial_dev}. PX4 USB CDC /dev/ttyACM* must be reserved for '
-            'mavlink-routerd/QGC only. Use the TELEM2/UART device, normally '
-            '/dev/serial0 on Raspberry Pi, for MicroXRCEAgent, or set '
-            'start_xrce_agent:=false if the XRCE agent is already running on '
-            'the correct UART.'
-        )
-
-    if xrce_serial_dev in ('/dev/ttyAMA0', '/dev/serial1'):
-        raise RuntimeError(
-            'Invalid XRCE serial device for this hardware setup: '
-            f'xrce_serial_dev is set to {xrce_serial_dev}. This Pi maps '
-            '/dev/serial0 to the TELEM2 UART, while /dev/ttyAMA0 is '
-            '/dev/serial1. Use xrce_serial_dev:=/dev/serial0.'
-        )
-
-    return []
 
 
 def generate_launch_description():
@@ -116,10 +110,34 @@ def generate_launch_description():
         description='true = backstepping + RBFNN, false = backstepping only'
     )
 
+    arg_arm_ff_enable = DeclareLaunchArgument(
+        'arm_ff_enable',
+        default_value='true',
+        description='true = dùng /arm/interaction_wrench làm feedforward torque trong external controller'
+    )
+
+    arg_arm_virtual_disturbance_enable = DeclareLaunchArgument(
+        'arm_virtual_disturbance_enable',
+        default_value='false',
+        description='true = tiêm torque nhiễu từ cánh tay ảo vào torque setpoint để mô phỏng plant bị cánh tay tác động'
+    )
+
     arg_start_data_logger = DeclareLaunchArgument(
         'start_data_logger',
-        default_value='false',
+        default_value='true',
         description='true = ghi dữ liệu thí nghiệm ra CSV/JSON/Markdown'
+    )
+
+    arg_arm_state_source = DeclareLaunchArgument(
+        'arm_state_source',
+        default_value='commanded',
+        description='commanded = /joint_states lấy từ lệnh khớp, gazebo = lấy từ joint thật trong Gazebo'
+    )
+
+    arg_use_gazebo_arm_visual = DeclareLaunchArgument(
+        'use_gazebo_arm_visual',
+        default_value='false',
+        description='true = vẫn gửi lệnh sang Gazebo arm để nhìn chuyển động; false = chỉ tính động lực học logic'
     )
 
     arg_experiment_case = DeclareLaunchArgument(
@@ -130,7 +148,7 @@ def generate_launch_description():
 
     arg_experiment_output_root = DeclareLaunchArgument(
         'experiment_output_root',
-        default_value=[EnvironmentVariable('HOME'), '/uam_verification_logs'],
+        default_value='/home/wicom/PX4-Autopilot/Tools/simulation/gz/pid_search_results/uam_verification',
         description='Thư mục gốc để lưu kết quả kiểm chứng'
     )
 
@@ -148,8 +166,8 @@ def generate_launch_description():
 
     arg_xrce_serial_dev = DeclareLaunchArgument(
         'xrce_serial_dev',
-        default_value='/dev/serial0',
-        description='Thiết bị TELEM2/UART cho MicroXRCEAgent khi sim=false. Trên Pi nên dùng /dev/serial0; không dùng PX4 USB CDC /dev/ttyACM*'
+        default_value='/dev/ttyAMA0',
+        description='Thiết bị serial cho MicroXRCEAgent khi sim=false, ví dụ /dev/ttyAMA0, /dev/ttyUSB0, /dev/ttyACM0'
     )
 
     arg_xrce_baud = DeclareLaunchArgument(
@@ -163,14 +181,17 @@ def generate_launch_description():
     enable_rbfnn = LaunchConfiguration('enable_rbfnn')
     handoff_mode = LaunchConfiguration('external_handoff_mode')
     rbfnn_output_enable = LaunchConfiguration('rbfnn_output_enable')
+    arm_ff_enable = LaunchConfiguration('arm_ff_enable')
+    arm_virtual_disturbance_enable = LaunchConfiguration('arm_virtual_disturbance_enable')
     start_data_logger = LaunchConfiguration('start_data_logger')
+    arm_state_source = LaunchConfiguration('arm_state_source')
+    use_gazebo_arm_visual = LaunchConfiguration('use_gazebo_arm_visual')
     experiment_case = LaunchConfiguration('experiment_case')
     experiment_output_root = LaunchConfiguration('experiment_output_root')
     experiment_log_rate_hz = LaunchConfiguration('experiment_log_rate_hz')
     start_xrce_agent = LaunchConfiguration('start_xrce_agent')
     xrce_serial_dev = LaunchConfiguration('xrce_serial_dev')
     xrce_baud = LaunchConfiguration('xrce_baud')
-    validate_hardware_serial_topology = OpaqueFunction(function=_validate_hardware_serial_topology)
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 0 – Micro XRCE-DDS Agent
@@ -207,6 +228,11 @@ def generate_launch_description():
             config_file,
             {
                 'rbfnn_enable': ParameterValue(rbfnn_output_enable, value_type=bool),
+                'arm_ff_enable': ParameterValue(arm_ff_enable, value_type=bool),
+                'arm_virtual_disturbance_enable': ParameterValue(
+                    arm_virtual_disturbance_enable,
+                    value_type=bool,
+                ),
             }
         ],
         remappings=[
@@ -234,7 +260,21 @@ def generate_launch_description():
     )
 
     # ═══════════════════════════════════════════════════════════
-    #  NODE 3 – Arm Gazebo Command Bridge (Sim only)
+    #  NODE 2.5 – Virtual Arm State
+    #  Dùng lệnh khớp làm nguồn /joint_states để tính nội lực arm,
+    #  không phụ thuộc joint vật lý/CAD trong Gazebo.
+    # ═══════════════════════════════════════════════════════════
+
+    arm_virtual_state_node = Node(
+        package='uam_controller',
+        executable='arm_virtual_state_node.py',
+        name='arm_virtual_state_node',
+        output='screen',
+        condition=IfCondition(PythonExpression(["'", arm_state_source, "' == 'commanded'"]))
+    )
+
+    # ═══════════════════════════════════════════════════════════
+    #  NODE 3 – Arm Gazebo Command Bridge (Sim only, optional visual)
     #  Chuyển JointState → lệnh Gazebo transport
     # ═══════════════════════════════════════════════════════════
 
@@ -243,7 +283,9 @@ def generate_launch_description():
         executable='arm_gazebo_command_node.py',
         name='arm_gazebo_command_node',
         output='screen',
-        condition=IfCondition(sim)
+        condition=IfCondition(PythonExpression([
+            "'", sim, "' == 'true' and '", use_gazebo_arm_visual, "' == 'true'"
+        ]))
     )
 
     # ═══════════════════════════════════════════════════════════
@@ -256,7 +298,9 @@ def generate_launch_description():
         executable='arm_gazebo_joint_state_bridge.py',
         name='arm_gazebo_joint_state_bridge',
         output='screen',
-        condition=IfCondition(sim)
+        condition=IfCondition(PythonExpression([
+            "'", sim, "' == 'true' and '", arm_state_source, "' == 'gazebo'"
+        ]))
     )
 
     # ═══════════════════════════════════════════════════════════
@@ -269,7 +313,9 @@ def generate_launch_description():
         executable='arm_initial_pose.py',
         name='arm_initial_pose',
         output='screen',
-        condition=IfCondition(sim)
+        condition=IfCondition(PythonExpression([
+            "'", sim, "' == 'true' and '", use_gazebo_arm_visual, "' == 'true'"
+        ]))
     )
 
     # ═══════════════════════════════════════════════════════════
@@ -366,6 +412,7 @@ def generate_launch_description():
 
     delayed_backstepping  = TimerAction(period=2.0,  actions=[backstepping_node])
     delayed_arm_dynamics  = TimerAction(period=2.5,  actions=[arm_dynamics_node])
+    delayed_arm_virtual   = TimerAction(period=2.7,  actions=[arm_virtual_state_node])
     delayed_arm_cmd       = TimerAction(period=3.0,  actions=[arm_cmd_node])
     delayed_arm_js_bridge = TimerAction(period=3.0,  actions=[arm_joint_state_bridge_node])
     delayed_arm_pose      = TimerAction(period=2.0,  actions=[arm_initial_pose_node])
@@ -379,7 +426,11 @@ def generate_launch_description():
         arg_rbfnn,
         arg_handoff_mode,
         arg_rbfnn_output_enable,
+        arg_arm_ff_enable,
+        arg_arm_virtual_disturbance_enable,
         arg_start_data_logger,
+        arg_arm_state_source,
+        arg_use_gazebo_arm_visual,
         arg_experiment_case,
         arg_experiment_output_root,
         arg_log_rate_hz,
@@ -388,13 +439,13 @@ def generate_launch_description():
         arg_xrce_baud,
         # ── Hướng dẫn ──
         startup_info,
-        validate_hardware_serial_topology,
         # ── DDS Agent (khởi động ngay) ──
         xrce_hardware,
         xrce_sim,
         # ── Các controller node (khởi động có trễ) ──
         delayed_backstepping,
         delayed_arm_dynamics,
+        delayed_arm_virtual,
         delayed_arm_cmd,
         delayed_arm_js_bridge,
         delayed_arm_pose,

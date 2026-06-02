@@ -69,9 +69,11 @@ class UAMTelemetryMonitor(Node):
         self.n_hat            = [0.0, 0.0, 0.0]
         self.tau              = [0.0, 0.0, 0.0]
         self.tau_arm_ff       = [0.0, 0.0, 0.0]
+        self.tau_arm_disturbance = [0.0, 0.0, 0.0]
         self.tau_norm         = [0.0, 0.0, 0.0]
         self.arm_ff_enabled   = False
         self.arm_ff_fresh     = False
+        self.arm_virtual_disturbance_enabled = False
         self.joints           = []
 
         self.create_timer(0.5, self._publish_telemetry)
@@ -100,6 +102,8 @@ class UAMTelemetryMonitor(Node):
         # 18..20 tau_norm
         # 21     arm_ff_enabled
         # 22     arm_ff_fresh
+        # 23..25 tau_arm_virtual_disturbance
+        # 26     arm_virtual_disturbance_enabled
         if len(msg.data) >= 23:
             self.n_hat          = [msg.data[9], msg.data[10], msg.data[11]]
             self.tau            = [msg.data[12], msg.data[13], msg.data[14]]
@@ -107,6 +111,9 @@ class UAMTelemetryMonitor(Node):
             self.tau_norm       = [msg.data[18], msg.data[19], msg.data[20]]
             self.arm_ff_enabled = msg.data[21] > 0.5
             self.arm_ff_fresh   = msg.data[22] > 0.5
+        if len(msg.data) >= 27:
+            self.tau_arm_disturbance = [msg.data[23], msg.data[24], msg.data[25]]
+            self.arm_virtual_disturbance_enabled = msg.data[26] > 0.5
             
     def _cb_joint_states(self, msg):
         self.joints = list(msg.position)
@@ -145,9 +152,11 @@ class UAMTelemetryMonitor(Node):
                 "n_hat": [round(v, 2) for v in self.n_hat],
                 "tau": [round(v, 2) for v in self.tau],
                 "tau_arm_ff": [round(v, 2) for v in self.tau_arm_ff],
+                "tau_arm_disturbance": [round(v, 2) for v in self.tau_arm_disturbance],
                 "tau_norm": [round(v, 2) for v in self.tau_norm],
                 "arm_ff_enabled": self.arm_ff_enabled,
-                "arm_ff_fresh": self.arm_ff_fresh
+                "arm_ff_fresh": self.arm_ff_fresh,
+                "arm_virtual_disturbance_enabled": self.arm_virtual_disturbance_enabled
             }
         }
 

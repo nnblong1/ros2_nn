@@ -17,7 +17,7 @@ Cách dùng:
   ros2 run uam_controller arm_trajectory_generator.py
 
   # Chỉ chạy 1 pattern cụ thể
-  ros2 run uam_controller arm_trajectory_generator.py --pattern sin --duration 120
+    
 
   # Biên độ nhỏ hơn (an toàn hơn cho UAV đang bay)
   ros2 run uam_controller arm_trajectory_generator.py --amplitude 0.3

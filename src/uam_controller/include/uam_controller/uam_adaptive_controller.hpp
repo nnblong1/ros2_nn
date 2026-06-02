@@ -23,11 +23,11 @@ using namespace std::chrono_literals;
 struct UAMSystemParams {
     double mass_nominal = 2.503868111; 
     double gravity      = 9.81;
-    double Ixx          = 0.0498920943; 
-    double Iyy          = 0.0530802134;
-    double Izz          = 0.023633241;
-    double Ixy          = 0.0000031976;
-    double Ixz          = -0.0021257404;
+    double Ixx          = 0.0499520044;
+    double Iyy          = 0.0531138089;
+    double Izz          = 0.0237241960;
+    double Ixy          = -0.0000251976;
+    double Ixz          = 0.0021257404;
     double Iyz          = 0.0002444194;
     double max_torque   = 5.6911624;   
     double max_joint_tau= 20.0;  
@@ -48,12 +48,12 @@ struct RateGains {
 struct JointGains { double Kp=50.0, Kd=5.0; };
 
 struct RBFNNParams {
-    int    num_neurons    = 25;
-    int    input_dim      = 6;    // X = [p, q, r, e_p, e_q, e_r]
+    int    num_neurons    = 45;
+    int    input_dim      = 21;   // X = [omega(3), e_omega(3), q_arm(6), dq_arm(6), tau_residual(3)]
     int    output_dim     = 3;    // angular acceleration disturbance estimate [rad/s^2]
-    double learning_rate  = 0.1;
-    double e_modification = 0.01;
-    double gaussian_width = 1.0;
+    double learning_rate  = 0.004;
+    double e_modification = 0.035;
+    double gaussian_width = 3.0;
 };
 
 class RBFNeuralNetwork {
@@ -81,6 +81,7 @@ public:
     ~UAMAdaptiveController() = default;
 
 private:
+    static constexpr int RBFNN_INPUT_DIM = 21;
     UAMSystemParams sys_;
     RateGains       rate_gains_;
     RBFNNParams     rbfnn_params_;
@@ -100,6 +101,8 @@ private:
     Eigen::Vector3d n_hat_        = Eigen::Vector3d::Zero();  // RBFNN angular acceleration estimate
     Eigen::Vector3d tau_arm_ff_   = Eigen::Vector3d::Zero();  // RNE feedforward torque [Nm]
     Eigen::Vector3d tau_arm_ff_target_ = Eigen::Vector3d::Zero(); // filtered target before ramp/rate limit
+    Eigen::Vector3d tau_arm_virtual_disturbance_ = Eigen::Vector3d::Zero(); // simulated arm disturbance [Nm]
+    Eigen::Vector3d tau_arm_virtual_disturbance_target_ = Eigen::Vector3d::Zero();
     Eigen::Vector3d tau_axis_max_ = Eigen::Vector3d::Constant(5.0); // Nm -> normalized PX4 torque
 
     double last_t_ = -1.0;
@@ -121,6 +124,10 @@ private:
     Eigen::Vector3d arm_ff_scale_ = Eigen::Vector3d::Ones();
     std::string arm_ff_input_frame_ = "flu";
     double arm_ff_reaction_sign_ = 1.0;
+    bool arm_virtual_disturbance_enabled_ = false;
+    Eigen::Vector3d arm_virtual_disturbance_limit_ = Eigen::Vector3d::Constant(0.25);
+    Eigen::Vector3d arm_virtual_disturbance_scale_ = Eigen::Vector3d::Ones();
+    double arm_virtual_disturbance_reaction_sign_ = 1.0;
     bool arm_cg_comp_enabled_ = false;
     double arm_cg_roll_gain_ = 0.0;
     double arm_cg_pitch_gain_ = 0.0;
@@ -152,6 +159,7 @@ private:
     bool has_arm_wrench_ = false;
     bool controller_enabled_ = false;
     bool rbfnn_output_enabled_ = false;
+    double rbfnn_output_gain_ = 0.5;
     uint64_t px4_timestamp_ = 0;
     
     double base_pitch_offset_ = 0.0;
@@ -191,7 +199,10 @@ private:
     Eigen::Vector3d sat_vec(const Eigen::Vector3d& v, const Eigen::Vector3d& lim) const;
     Eigen::Vector3d rate_limit_vec(const Eigen::Vector3d& current, const Eigen::Vector3d& target, double max_delta) const;
     void update_arm_feedforward(double elapsed_since_enable, double dt, bool takeoff_sensitive);
+    void update_arm_virtual_disturbance(double elapsed_since_enable, double dt, bool takeoff_sensitive);
     void update_arm_cg_bias();
+    Eigen::VectorXd build_rbfnn_input() const;
+    bool rbfnn_ready(bool takeoff_sensitive, double now) const;
     bool inputs_fresh(double now) const;
     bool arm_ff_fresh(double now) const;
     bool in_takeoff_sensitive_phase(double elapsed_since_enable) const;
