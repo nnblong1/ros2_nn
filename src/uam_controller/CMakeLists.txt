@@ -61,6 +61,8 @@ install(PROGRAMS
   scripts/arm_virtual_state_node.py
   scripts/rbfnn_compare_ab_results.py
   scripts/run_rbfnn_verification_suite.py
+  scripts/run_case_d_robust_select.py
+  scripts/run_uam_stability_autopilot.py
   scripts/qgc_rbfnn_trigger.py
   
   DESTINATION lib/${PROJECT_NAME}

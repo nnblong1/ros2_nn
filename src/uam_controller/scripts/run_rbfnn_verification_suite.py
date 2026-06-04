@@ -35,6 +35,11 @@ CASES = {
         "stage": "rbfnn_arm_no_ff",
         "description": "RBFNN output on, arm_ff off, virtual disturbance on",
     },
+    "D": {
+        "label": "case_d_no_rbfnn_no_ff",
+        "stage": "bs_arm_disturbance_no_ff",
+        "description": "RBFNN output off, arm_ff off, virtual disturbance on",
+    },
 }
 
 MEDIAN_METRICS = (
@@ -202,6 +207,19 @@ def count_verdicts(rows: list[dict[str, str]]) -> str:
     return ";".join(f"{key}:{counts[key]}" for key in sorted(counts))
 
 
+def verdict_count(verdict_counts: object, verdict: str) -> int:
+    counts: dict[str, int] = {}
+    for item in str(verdict_counts or "").split(";"):
+        if ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        try:
+            counts[key.strip()] = int(value)
+        except ValueError:
+            continue
+    return counts.get(verdict, 0)
+
+
 def median_rows_for_trajectory(traj_dir: Path, cases: list[str]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for case_key in cases:
@@ -242,6 +260,34 @@ def comparison_conclusion(rows: list[dict[str, object]]) -> str:
     rate_c = finite_float(c.get("median_rate_err_rms_radps"))
     rate_b = finite_float(b.get("median_rate_err_rms_radps"))
 
+    for case_key, row in (("A", a), ("B", b)):
+        ff_max = finite_float(row.get("median_arm_ff_max_nm"))
+        if not math.isfinite(ff_max) or ff_max <= 1.0e-6:
+            return (
+                "FAIL_ARM_FF_ZERO: Case A/B requested arm_ff, but median arm_ff_max_nm is zero. "
+                "Do not judge RBFNN until the YAML restores nonzero arm_ff_scale_* and arm_ff limits."
+            )
+
+    b_repeats = int(b.get("repeats", 0) or 0)
+    b_fail_xy = verdict_count(b.get("verdict_counts"), "FAIL_XY")
+    if b_repeats > 0 and b_fail_xy >= b_repeats:
+        return "FAIL_RBFNN_UNSTABLE: every Case B trial failed XY, so median-rate improvement cannot be accepted."
+
+    d = by_case.get("D")
+    no_ff_conclusion = ""
+    if d is not None:
+        c_vs_d_rate = finite_float(d.get("median_rate_err_rms_radps")) - rate_c
+        c_vs_d_xy = finite_float(c.get("median_xy_mean_m")) - finite_float(d.get("median_xy_mean_m"))
+        c_vs_d_angle = finite_float(c.get("median_angle_rms_deg")) - finite_float(d.get("median_angle_rms_deg"))
+        c_n_hat = finite_float(c.get("median_n_hat_norm_rms"))
+        if all(math.isfinite(v) for v in (c_vs_d_rate, c_vs_d_xy, c_vs_d_angle, c_n_hat)):
+            if c_vs_d_rate > 0.0 and c_vs_d_xy <= 0.02 and c_vs_d_angle <= 0.05 and c_n_hat > 1.0e-4:
+                no_ff_conclusion = " C beats D in the no-FF pair, so RBFNN contribution is measurable without arm_ff."
+            elif c_vs_d_rate <= 0.0:
+                no_ff_conclusion = " C does not beat D in the no-FF pair, so RBFNN-only contribution is weak."
+            elif c_vs_d_xy > 0.02 or c_vs_d_angle > 0.05:
+                no_ff_conclusion = " C improves rate against D but adds XY/attitude penalty in the no-FF pair."
+
     if math.isfinite(dot_a) and dot_a < 0.0:
         return "FAIL_BAD_ARM_FF_SIGN: Case A median arm_ff/disturbance dot product is negative."
     if math.isfinite(dot_b) and dot_b < 0.0:
@@ -255,10 +301,10 @@ def comparison_conclusion(rows: list[dict[str, object]]) -> str:
         and residual_delta <= 0.0
         and n_hat > 1.0e-4
     ):
-        return "PASS_RBFNN_CONTRIBUTION: B improves rate RMS without meaningful XY/attitude/residual penalty."
+        return "PASS_RBFNN_CONTRIBUTION: B improves rate RMS without meaningful XY/attitude/residual penalty." + no_ff_conclusion
     if math.isfinite(rate_c) and math.isfinite(rate_b) and rate_c < rate_b:
-        return "ARM_FF_SUSPECT: Case C has lower median rate RMS than B, so arm_ff sign/scale still needs correction."
-    return "FAIL_RBFNN_CONTRIBUTION: B does not meet the required improvement gates against A."
+        return "ARM_FF_SUSPECT: Case C has lower median rate RMS than B, so arm_ff sign/scale still needs correction." + no_ff_conclusion
+    return "FAIL_RBFNN_CONTRIBUTION: B does not meet the required improvement gates against A." + no_ff_conclusion
 
 
 def write_median_comparison(traj_dir: Path, cases: list[str], output_prefix: str) -> tuple[Path, Path] | None:
@@ -284,10 +330,12 @@ def write_median_comparison(traj_dir: Path, cases: list[str], output_prefix: str
         "median_xy_mean_m",
         "median_xy_max_m",
         "median_n_hat_norm_rms",
+        "median_arm_ff_max_nm",
         "median_tau_residual_rms_nm",
         "median_ff_disturbance_dot_mean",
     ]
-    lines = ["# RBFNN A/B/C Median Comparison", ""]
+    case_title = "/".join(str(row.get("case", "")) for row in rows)
+    lines = [f"# RBFNN {case_title} Median Comparison", ""]
     lines.append("| " + " | ".join(table_headers) + " |")
     lines.append("| " + " | ".join(["---"] * len(table_headers)) + " |")
     for row in rows:
@@ -311,12 +359,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=None, help="Best YAML config to verify. Defaults to latest final_best YAML.")
     parser.add_argument("--output-root", type=Path, default=None, help="Verification output root.")
     parser.add_argument("--gz-root", type=Path, default=DEFAULT_GZ_ROOT)
-    parser.add_argument("--cases", default="A,B,C", help="Comma-separated subset of A,B,C.")
+    parser.add_argument("--cases", default="A,B,C,D", help="Comma-separated subset of A,B,C,D.")
     parser.add_argument("--pattern", default="slow_step", choices=("slow_step", "sin", "step", "chirp", "combined"))
     parser.add_argument("--duration-s", type=float, default=120.0)
     parser.add_argument("--amplitude", type=float, default=0.05)
     parser.add_argument("--rate-hz", type=int, default=5)
-    parser.add_argument("--repeats", type=int, default=3, help="Number of fixed-config repeats per A/B/C case.")
+    parser.add_argument("--repeats", type=int, default=3, help="Number of fixed-config repeats per selected case.")
     parser.add_argument("--include-strong", action="store_true", help="Also run the stronger combined trajectory.")
     parser.add_argument("--strong-pattern", default="combined", choices=("slow_step", "sin", "step", "chirp", "combined"))
     parser.add_argument("--strong-duration-s", type=float, default=180.0)
@@ -394,19 +442,22 @@ def main() -> int:
                 write_suite_summary(args.output_root / "suite_summary.md", commands, args, config)
                 return rc
 
-        compare_script = Path(__file__).resolve().with_name("rbfnn_compare_ab_results.py")
-        compare_cmd = [
-            sys.executable,
-            str(compare_script),
-            "--root",
-            str(traj_dir),
-            "--output-prefix",
-            output_prefix,
-        ]
-        commands.append(compare_cmd)
-        rc = run_command(compare_cmd, cwd=args.gz_root, env=env, dry_run=args.dry_run)
-        if rc != 0:
-            print(f"[warn] comparison failed for {traj_dir} with exit code {rc}", file=sys.stderr)
+        if all(case_key in args.cases for case_key in ("A", "B", "C")):
+            compare_script = Path(__file__).resolve().with_name("rbfnn_compare_ab_results.py")
+            compare_cmd = [
+                sys.executable,
+                str(compare_script),
+                "--root",
+                str(traj_dir),
+                "--output-prefix",
+                output_prefix,
+            ]
+            if "D" in args.cases:
+                compare_cmd.append("--include-d")
+            commands.append(compare_cmd)
+            rc = run_command(compare_cmd, cwd=args.gz_root, env=env, dry_run=args.dry_run)
+            if rc != 0:
+                print(f"[warn] comparison failed for {traj_dir} with exit code {rc}", file=sys.stderr)
         if not args.dry_run:
             median_outputs = write_median_comparison(traj_dir, args.cases, output_prefix)
             if median_outputs:

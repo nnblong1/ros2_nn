@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Compare A/B/C RBFNN experiment summaries.
+"""Compare A/B/C/D RBFNN experiment summaries.
 
 Expected cases:
   A: RBFNN output off, arm feedforward on
   B: RBFNN output on,  arm feedforward on
   C: RBFNN output on,  arm feedforward off
+  D: RBFNN output off, arm feedforward off
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ DEFAULT_CASES = (
     ("A_no_rbfnn_ff", "case_a_no_rbfnn_ff"),
     ("B_rbfnn_ff", "case_b_rbfnn_ff"),
     ("C_rbfnn_no_ff", "case_c_rbfnn_no_ff"),
+    ("D_no_rbfnn_no_ff", "case_d_no_rbfnn_no_ff"),
 )
 
 
@@ -134,6 +136,13 @@ def verdict_text(rows: list[dict[str, Any]]) -> str:
     n_hat = finite_float(b["n_hat_norm_rms"])
     ff_dot_a = finite_float(a.get("ff_disturbance_dot_mean"))
     ff_dot_b = finite_float(b.get("ff_disturbance_dot_mean"))
+    ff_max_a = finite_float(a.get("tau_arm_ff_norm_max_nm"))
+    ff_max_b = finite_float(b.get("tau_arm_ff_norm_max_nm"))
+
+    if not math.isfinite(ff_max_a) or ff_max_a <= 1.0e-6:
+        return "Case A requested arm_ff, but tau_arm_ff max is zero: restore nonzero arm_ff_scale_* before judging RBFNN."
+    if not math.isfinite(ff_max_b) or ff_max_b <= 1.0e-6:
+        return "Case B requested arm_ff, but tau_arm_ff max is zero: restore nonzero arm_ff_scale_* before judging RBFNN."
 
     if math.isfinite(ff_dot_a) and ff_dot_a < 0.0:
         return "Case A has negative arm_ff/disturbance dot product: arm_ff sign is likely wrong before RBFNN is evaluated."
@@ -144,19 +153,45 @@ def verdict_text(rows: list[dict[str, Any]]) -> str:
         return "Some required metrics are missing; inspect the summary paths manually."
 
     if rate_improvement > 0.0 and angle_delta <= 0.05 and xy_delta <= 0.02 and residual_delta <= 0.0 and n_hat > 1.0e-4:
-        return "B improves rate tracking against A without meaningful attitude/XY penalty: RBFNN contribution is measurable."
+        base = "B improves rate tracking against A without meaningful attitude/XY penalty: RBFNN contribution is measurable."
+        if len(rows) >= 4:
+            return base + " " + no_ff_verdict_text(c, rows[3])
+        return base
 
     if abs(rate_improvement) <= 0.005 and n_hat <= 1.0e-4:
         return "B is nearly identical to A and n_hat is very small: RBFNN contribution is still weak."
 
     if rate_improvement < 0.0 or angle_delta > 0.05 or xy_delta > 0.02 or residual_delta > 0.0:
-        return "B is worse than A on rate, attitude, XY, or residual torque: fix arm_ff sign/scale first, then retune RBFNN."
+        base = "B is worse than A on rate, attitude, XY, or residual torque: fix arm_ff sign/scale first, then retune RBFNN."
+        if len(rows) >= 4:
+            return base + " " + no_ff_verdict_text(c, rows[3])
+        return base
 
     c_rate = finite_float(c["rate_err_rms_radps"])
     if math.isfinite(c_rate) and c_rate < finite_float(b["rate_err_rms_radps"]):
-        return "C outperforms B: arm_ff may be overcompensating or using the wrong scale/sign."
+        base = "C outperforms B: arm_ff may be overcompensating or using the wrong scale/sign."
+        if len(rows) >= 4:
+            return base + " " + no_ff_verdict_text(c, rows[3])
+        return base
 
     return "RBFNN has some activity, but the improvement is not yet strong enough for a clean claim."
+
+
+def no_ff_verdict_text(c: dict[str, Any], d: dict[str, Any]) -> str:
+    c_rate = finite_float(c.get("rate_err_rms_radps"))
+    d_rate = finite_float(d.get("rate_err_rms_radps"))
+    c_xy = finite_float(c.get("xy_mean_m"))
+    d_xy = finite_float(d.get("xy_mean_m"))
+    c_angle = finite_float(c.get("angle_rms_deg"))
+    d_angle = finite_float(d.get("angle_rms_deg"))
+    c_n_hat = finite_float(c.get("n_hat_norm_rms"))
+    if not all(math.isfinite(v) for v in (c_rate, d_rate, c_xy, d_xy, c_angle, d_angle, c_n_hat)):
+        return "C/D no-FF metrics are incomplete."
+    if d_rate > c_rate and c_xy <= d_xy + 0.02 and c_angle <= d_angle + 0.05 and c_n_hat > 1.0e-4:
+        return "C beats D in the no-FF pair, so RBFNN contribution is measurable without arm_ff."
+    if c_rate >= d_rate:
+        return "C does not beat D in the no-FF pair, so RBFNN-only contribution is weak."
+    return "C improves rate against D but adds XY/attitude penalty in the no-FF pair."
 
 
 def write_markdown(path: Path, rows: list[dict[str, Any]], conclusion: str) -> None:
@@ -174,7 +209,8 @@ def write_markdown(path: Path, rows: list[dict[str, Any]], conclusion: str) -> N
         "delta_tau_residual_norm_rms_nm_vs_A",
     ]
 
-    lines = ["# RBFNN A/B/C Comparison", ""]
+    case_title = "/".join(str(row.get("case", "")).split("_", 1)[0] for row in rows)
+    lines = [f"# RBFNN {case_title} Comparison", ""]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
     for row in rows:
@@ -199,6 +235,8 @@ def main() -> int:
     parser.add_argument("--case-a", default=DEFAULT_CASES[0][1], help="Token used to locate Case A summary.")
     parser.add_argument("--case-b", default=DEFAULT_CASES[1][1], help="Token used to locate Case B summary.")
     parser.add_argument("--case-c", default=DEFAULT_CASES[2][1], help="Token used to locate Case C summary.")
+    parser.add_argument("--case-d", default=DEFAULT_CASES[3][1], help="Token used to locate optional Case D summary.")
+    parser.add_argument("--include-d", action="store_true", help="Include Case D if present.")
     parser.add_argument("--output-prefix", default="rbfnn_ab_comparison", help="Output file prefix under --root.")
     args = parser.parse_args()
 
@@ -207,6 +245,8 @@ def main() -> int:
         (DEFAULT_CASES[1][0], args.case_b),
         (DEFAULT_CASES[2][0], args.case_c),
     )
+    if args.include_d:
+        case_specs = case_specs + ((DEFAULT_CASES[3][0], args.case_d),)
 
     rows: list[dict[str, Any]] = []
     missing: list[str] = []
