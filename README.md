@@ -1,583 +1,109 @@
-# UAM PX4 + Gazebo Simulation Runbook
+# UAM PX4 + ROS 2 Runbook
 
-Tài liệu này tổng hợp luồng chạy end-to-end cho đề tài UAM quadrotor + robot arm 6 DoF:
+Tài liệu này tách rõ hai chế độ vận hành của hệ UAM quadrotor + tay máy 6 DoF:
 
-- PX4 SITL + Gazebo
-- QGroundControl takeoff / hover
-- chuyển sang external backstepping + RBFNN
-- kích hoạt cánh tay để tạo nhiễu
-- ghi log, phân tích kết quả, và tuning tham số
+- **Phần A: mô phỏng với QGC/Gazebo**: PX4 SITL, Gazebo, QGroundControl, virtual arm disturbance, logger và bảng kết quả.
+- **Phần B: chạy thực tế với QGC/PX4**: PX4 thật, Raspberry Pi 4B, Micro XRCE-DDS serial, QGC điều khiển, external rate controller chỉ bật sau khi hover ổn định.
 
-## 1. Cấu trúc liên quan
-
-- `models/x500_hop/model.sdf`: mô hình UAV + arm + plugin Gazebo
-- `tools/`: các script chạy mô phỏng, bridge topic, logger, analyzer
-- `~/ros2_ws/src/uam_controller`: launch file, controller node, arm node, logger node
-
-## 2. Chuẩn bị môi trường
-
-Mỗi terminal ROS2 nên source đúng môi trường:
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-```
-
-Build lại khi có thay đổi code:
-
-```bash
-cd ~/ros2_ws
-colcon build --packages-select uam_controller
-
-cd ~/PX4-Autopilot
-make px4_sitl gz_x500_hop
-```
-
-Khi cần bắt đầu một phiên mô phỏng sạch:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/stop_uam_sim.sh
-```
-
-## 3. Luồng chạy nhanh nhất
-
-### 3.1 Baseline hover với PX4 internal controller
-
-Đây là bước kiểm tra UAV có thể takeoff và hold ở khoảng 2 m trước khi bật external control.
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/run_qgc_baseline.py --controller-mode baseline
-```
-
-Hoặc dùng wrapper shell:
-
-```bash
-./tools/run_uam_qgc.sh baseline
-```
-
-Luồng này sẽ:
-
-- cleanup các tiến trình cũ
-- chạy `make px4_sitl gz_x500_hop`
-- chạy `ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true enable_rbfnn:=false`
-- tự khởi động bridge `gz_joint_state_bridge.py` để nối `/model/x500_hop_0/joint_state` sang `/joint_states`
-
-Thao tác bay:
-
-1. Mở QGroundControl.
-2. Arm.
-3. Takeoff lên khoảng 2 m.
-4. Giữ hover ổn định với PX4 internal controller.
-
-## 4. Chuyển sang external backstepping + RBFNN
-
-Sau khi baseline hover ổn định, bật external mode bằng helper:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/run_qgc_baseline.py --controller-mode external --rbfnn-output-enable true
-```
-
-Hoặc:
-
-```bash
-./tools/run_uam_qgc.sh auto
-```
-
-Các chế độ quan trọng:
-
-- `--controller-mode external`: bật `MC_RATE_EXT_EN=1`
-- `--rbfnn-output-enable false`: chỉ backstepping, chưa bật output RBFNN
-- `--rbfnn-output-enable true`: backstepping + RBFNN
-- `--external-handoff-mode manual|auto`: chọn chuyển tay hay tự chuyển sau hover ổn định
-- `--profile pitch_damped`: profile PX4 an toàn hơn khi takeoff còn rung hoặc pitch chưa ổn
-
-Nếu chạy manual, khi UAV đã hover ổn định, có thể gọi:
-
-```bash
-source ~/ros2_ws/install/setup.bash
-ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
-```
-
-Ghi nhớ:
-
-- external controller chỉ nên bật sau khi hover ổn định
-- nếu node ROS chết hoặc topic stale, PX4 sẽ fallback về internal control
-- file launch `uam_qgc_mode.launch.py` là nhánh QGC, không dùng `uam_mission_bridge`
-
-## 5. Kích hoạt cánh tay và tuning RBFNN
-
-Để test disturbance rejection của backstepping + RBFNN:
-
-### 5.1 Chạy case kiểm chứng có log
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/run_uam_verification.sh internal_hover
-./tools/run_uam_verification.sh external_bs_hover
-./tools/run_uam_verification.sh external_rbfnn_hover
-./tools/run_uam_verification.sh external_rbfnn_arm_sin02
-./tools/run_uam_verification.sh external_rbfnn_arm_combined03
-```
-
-Các case này lần lượt dùng để:
-
-- `internal_hover`: baseline PX4
-- `external_bs_hover`: external backstepping בלבד, chưa bật RBFNN
-- `external_rbfnn_hover`: external backstepping + RBFNN, arm fixed
-- `external_rbfnn_arm_sin02`: arm sin nhẹ với biên độ 0.2 rad
-- `external_rbfnn_arm_combined03`: arm excitation tổng hợp, biên độ 0.3 rad
-
-### 5.2 Ghi chú về handoff
-
-`run_uam_verification.sh` mặc định chờ tay. Sau khi hover ổn định 3 giây, bạn có thể:
-
-```bash
-source ~/ros2_ws/install/setup.bash
-ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
-```
-
-Các biến môi trường hữu ích:
-
-- `HANDOFF_MODE=manual|auto`
-- `HANDOFF_SETTLE_S=3`
-- `AUTO_ARM_AFTER_S=<seconds>`
-- `RESULTS_ROOT=/path/to/output`
-- `LOG_RATE_HZ=20.0`
-
-### 5.3 Kích arm để tạo nhiễu
-
-Mặc định launch hiện dùng `arm_state_source:=commanded`: cánh tay được mô phỏng
-ở mức động học để tính nội lực, không phụ thuộc joint vật lý trong Gazebo.
-Luồng dùng cho tính toán lực/moment:
+Kiến trúc điều khiển hiện tại:
 
 ```text
-/arm_controller/joint_trajectory_plan
-        ↓
-arm_virtual_state_node.py
-        ↓
-/joint_states
-        ↓
-arm_dynamics_node.py
-        ↓
-/arm/interaction_wrench
+QGC / PX4 position controller
+        -> PX4 attitude controller
+        -> /fmu/out/vehicle_rates_setpoint
+        -> ROS 2 uam_backstepping_rbfnn_node
+        -> /fmu/in/vehicle_torque_setpoint
+        -> /fmu/in/vehicle_thrust_setpoint
+        -> PX4 external mc_rate_control branch
+        -> PX4 control allocation
+        -> motors
 ```
 
-Chế độ này phù hợp khi chỉ cần lực/moment do chuyển động cánh tay tác dụng lên
-UAV, chưa cần va chạm/contact hay mô phỏng joint vật lý thật trong Gazebo.
+Khi `MC_RATE_EXT_EN=0`, PX4 dùng rate PID nội bộ. Khi `MC_RATE_EXT_EN=1`, PX4 nhận torque/thrust từ ROS 2 nếu dữ liệu còn mới; nếu ROS 2 ngừng publish/stale, PX4 fallback về rate PID nội bộ.
 
-Trong giai đoạn tuning RBFNN, nên bắt đầu với arm fixed, rồi mới cho arm chuyển động nhẹ.
+## Chuẩn Bị Chung
 
-Ví dụ:
-
-```bash
-source ~/ros2_ws/install/setup.bash
-ros2 run uam_controller arm_trajectory_generator.py --pattern sin --duration 120 --amplitude 0.2 --rate 10
-```
-
-Hoặc:
-
-```bash
-ros2 run uam_controller arm_trajectory_generator.py --pattern combined --duration 300 --amplitude 0.3 --rate 10
-```
-
-Lưu ý:
-
-- `arm_virtual_state_node.py` tạo `/joint_states` từ lệnh khớp và có giới hạn vận tốc/gia tốc.
-- `arm_dynamics_node.py` dùng `/joint_states` để tính `/arm/interaction_wrench`.
-- `rbfnn_data_logger.py` ghi log đủ để dùng cho báo cáo và phân tích.
-- Nếu vẫn muốn thử điều khiển joint vật lý trong Gazebo, chạy launch với
-  `arm_state_source:=gazebo use_gazebo_arm_visual:=true`.
-
-## 6. Tuning PID baseline trước khi bật external
-
-Nếu cần chỉnh lại PX4 baseline trước khi qua external control:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-python3 tools/px4_pid_slider_tuner.py --autostart
-```
-
-Tuner này:
-
-- mở UI slider cho các tham số PX4
-- cho phép arm / disarm trực tiếp
-- lưu preset JSON trong `Tools/simulation/gz/pid_search_results/pid_slider_presets/`
-- copy được các dòng `param set-default ...`
-
-Tuning tự động có thể dùng:
-
-```bash
-python3 tools/px4_slider_autotune.py --trials 20 --stop-when-good
-```
-
-Khuyến nghị cho baseline:
-
-- tune trước khi bật external
-- ưu tiên ổn định hover 2 m
-- nếu đã có preset tốt, chỉ cần nạp lại preset đó trước khi chạy external experiments
-- nếu takeoff còn rung, thử thêm `--profile pitch_damped` ở `run_qgc_baseline.py` hoặc wrapper `run_uam_qgc.sh`
-
-## 7. Ghi log và phân tích kết quả
-
-Logger của thí nghiệm lưu dữ liệu dưới:
-
-```text
-Tools/simulation/gz/pid_search_results/uam_verification/<timestamp>_<case>/
-```
-
-Trong thư mục đó thường có:
-
-- `flight_timeseries.csv`
-- `metadata.json`
-- `summary.json`
-- `summary.md`
-
-Để so sánh log PX4 native và log RBFNN:
-
-```bash
-python3 tools/px4_uam_log_analyzer.py \
-  <px4_native_log.ulg> \
-  <rbfnn_custom_log.ulg> \
-  --output-dir px4_uam_log_analysis \
-  --nn-topic uam_debug \
-  --nn-fields n_hat[0],n_hat[1],n_hat[2]
-```
-
-Script analyzer chấp nhận cả `.ulg/.ulog` lẫn `.csv`.
-
-Kết quả sinh ra:
-
-- đồ thị position response
-- đồ thị attitude response
-- đồ thị output RBFNN
-- bảng RMSE / max error trong `tracking_metrics.md`
-
-### 7.1 So sánh A/B/C để chứng minh đóng góp RBFNN
-
-Controller hiện dùng input RBFNN 21 chiều:
-
-```text
-[omega(3), e_omega(3), q_arm(6), dq_arm(6), tau_residual(3)]
-```
-
-Trong đó `tau_residual` xấp xỉ phần nhiễu cánh tay còn lại sau nhánh
-`arm_ff`. Vì vậy các YAML cũ vẫn chạy được, nhưng nên tune lại vì
-`rbfnn_gaussian_width` cũ quá nhỏ cho input nhiều chiều.
-
-Sau khi có YAML tham số tốt, chạy 3 ca có cùng trajectory cánh tay và cùng
-điều kiện bay. Điểm khác biệt duy nhất là nhánh RBFNN và feedforward cánh tay.
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-
-REPORT_ROOT=/home/wicom/uam_results/rbfnn_ab_report_$(date +%Y%m%d_%H%M%S)
-BEST_CONFIG=/home/wicom/uam_results/<run>/final_best_uam_controller_params.yaml
-```
-
-Case A: tắt output RBFNN, giữ `arm_ff`.
-
-```bash
-ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true \
-  config_file:=$BEST_CONFIG \
-  rbfnn_output_enable:=false \
-  arm_ff_enable:=true \
-  arm_virtual_disturbance_enable:=true \
-  arm_state_source:=commanded \
-  use_gazebo_arm_visual:=false \
-  experiment_case:=case_a_no_rbfnn_ff \
-  experiment_output_root:=$REPORT_ROOT
-```
-
-Case B: bật RBFNN và giữ `arm_ff`.
-
-```bash
-ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true \
-  config_file:=$BEST_CONFIG \
-  rbfnn_output_enable:=true \
-  arm_ff_enable:=true \
-  arm_virtual_disturbance_enable:=true \
-  arm_state_source:=commanded \
-  use_gazebo_arm_visual:=false \
-  experiment_case:=case_b_rbfnn_ff \
-  experiment_output_root:=$REPORT_ROOT
-```
-
-Case C: bật RBFNN, tắt `arm_ff` để xem RBFNN có tự học residual hay không.
-
-```bash
-ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true \
-  config_file:=$BEST_CONFIG \
-  rbfnn_output_enable:=true \
-  arm_ff_enable:=false \
-  arm_virtual_disturbance_enable:=true \
-  arm_state_source:=commanded \
-  use_gazebo_arm_visual:=false \
-  experiment_case:=case_c_rbfnn_no_ff \
-  experiment_output_root:=$REPORT_ROOT
-```
-
-Trong mỗi case, sau khi UAV hover và external controller đã bật, chạy cùng một
-trajectory cánh tay:
-
-```bash
-ros2 run uam_controller arm_trajectory_generator.py \
-  --pattern slow_step --duration 120 --amplitude 0.05 --rate 5
-
-ros2 run uam_controller arm_trajectory_generator.py \
-  --pattern combined --duration 180 --amplitude 0.08 --rate 10
-```
-
-Sau khi chạy đủ 3 case, tạo bảng so sánh:
-
-```bash
-ros2 run uam_controller rbfnn_compare_ab_results.py --root "$REPORT_ROOT"
-```
-
-Hoặc chạy tự động cả 3 case A/B/C bằng YAML best:
+Mỗi terminal ROS 2:
 
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/wicom/ros2_ws/install/setup.bash
-
-ros2 run uam_controller run_rbfnn_verification_suite.py \
-  --config /home/wicom/uam_results/<run>/final_best_uam_controller_params.yaml \
-  --output-root /home/wicom/uam_results/rbfnn_verification_suite_$(date +%Y%m%d_%H%M%S) \
-  --pattern slow_step \
-  --duration-s 120 \
-  --amplitude 0.05 \
-  --rate-hz 5 \
-  --repeats 3 \
-  --include-strong
 ```
 
-Script này dùng đúng YAML đã tìm được ở chế độ `--fixed-config`, tự chạy:
-
-```text
-Case A: RBFNN off, arm_ff on,  virtual disturbance on
-Case B: RBFNN on,  arm_ff on,  virtual disturbance on
-Case C: RBFNN on,  arm_ff off, virtual disturbance on
-```
-
-Mặc định nên dùng `slow_step amp=0.05` và `combined amp=0.08`. Không dùng
-`slow_step amp=0.25` làm case chính nếu log báo `joint_pos_span` lớn bất
-thường, vì khi đó dữ liệu joint state đã trôi khỏi lệnh điều khiển.
-
-Với `--repeats 3`, script tạo thêm bảng median trong từng thư mục trajectory:
-
-```text
-rbfnn_ab_comparison_<pattern>_ampXXX_median.csv
-rbfnn_ab_comparison_<pattern>_ampXXX_median.md
-```
-
-Kết quả cần xem chính:
-
-- `rate_err_rms_radps`: Case B phải giảm so với Case A.
-- `n_hat_norm_rms/max`: không được gần 0 toàn bộ thời gian và không tăng vô hạn.
-- `angle_rms_deg`, `xy_mean_m`: Case B không được xấu hơn Case A đáng kể.
-- `tau_residual_rms_nm`: Case B không nên lớn hơn Case A.
-- `ff_disturbance_dot_mean`: nếu âm thì `arm_ff` nhiều khả năng sai dấu và cần
-  sửa trước khi kết luận về RBFNN.
-- Case C giúp kiểm tra `arm_ff` có đang bù quá mạnh hoặc sai scale/sign không.
-
-### 7.2 Quy trình hiện tại để lấy kết quả tốt nhất
-
-Kết quả kiểm chứng gần nhất cho thấy YAML conservative đã tốt hơn YAML tuning
-ban đầu. Với `slow_step_amp080`, Case B cải thiện rõ so với Case A; với
-`combined_amp080`, Case B cải thiện XY nhưng rate/attitude chưa đủ vượt gate.
-Vì vậy chưa nên chốt báo cáo chỉ bằng một run `--repeats 3`. Quy trình nên làm
-tiếp là chạy lại nhiều lần hơn, sau đó thêm bài test sai lệch mô hình
-`arm_ff` để làm rõ đóng góp của RBFNN.
-
-YAML candidate hiện tại:
-
-```bash
-BEST_CONFIG=/home/wicom/uam_results/rbfnn_best_param_search_fffix_20260529_181119/yaml_conservation.yaml
-```
-
-Không dùng YAML cũ trước khi sửa dấu `arm_ff`, ví dụ các run có
-`arm_ff_scale_pitch` âm trong khi `arm_virtual_disturbance_scale_pitch` dương.
-Những YAML đó làm feedforward khuếch đại nhiễu và làm kết luận về RBFNN sai.
-
-Chạy lại kiểm chứng chính với nhiều repeat hơn:
-
-```bash
-cd /home/wicom/PX4-Autopilot/Tools/simulation/gz
-./tools/stop_uam_sim.sh
-
-source /opt/ros/humble/setup.bash
-source /home/wicom/ros2_ws/install/setup.bash
-
-ros2 run uam_controller run_rbfnn_verification_suite.py \
-  --config "$BEST_CONFIG" \
-  --output-root /home/wicom/uam_results/rbfnn_verification_suite_conservative_$(date +%Y%m%d_%H%M%S) \
-  --pattern slow_step \
-  --duration-s 300 \
-  --amplitude 0.08 \
-  --rate-hz 5 \
-  --repeats 5 \
-  --include-strong
-```
-
-Nếu máy đủ ổn định, dùng `--repeats 7` để lấy median đáng tin hơn. Không nên
-đổi YAML giữa các case A/B/C trong cùng một suite.
-
-Sau khi chạy xong, đọc hai file median:
-
-```bash
-cat /home/wicom/uam_results/<suite>/slow_step_amp080/rbfnn_ab_comparison_slow_step_amp080_median.md
-cat /home/wicom/uam_results/<suite>/combined_amp080/rbfnn_ab_comparison_combined_amp080_median.md
-```
-
-Tiêu chí chọn kết quả tốt để đưa vào báo cáo:
-
-- Case B có số `OK/GOOD` nhiều hơn hoặc ít nhất không kém Case A.
-- `median_rate_err_rms_radps` của B nhỏ hơn A, đặc biệt ở `slow_step_amp080`.
-- `median_xy_mean_m` và `median_xy_max_m` của B không xấu hơn A; nếu tốt hơn
-  rõ thì ghi nhận là RBFNN giúp giảm drift.
-- `median_angle_rms_deg` của B không tăng đáng kể so với A.
-- `median_n_hat_norm_rms` khác 0 nhưng nhỏ, không có dấu hiệu tăng vô hạn.
-- `median_ff_disturbance_dot_mean` dương; nếu âm thì không dùng run đó.
-
-Nếu B vẫn tệ hơn A, giảm tác động RBFNN thêm một mức rồi chạy lại:
-
-```text
-rbfnn_output_gain: 0.20 -> 0.30
-rbfnn_lr:          0.0015 -> 0.0025
-rbfnn_e_modification: 0.05 -> 0.08
-```
-
-Không tăng `rbfnn_lr` khi B đang gây drift XY, vì lúc đó mạng đang học nhiễu
-hoặc tạo bias chứ không bù residual sạch.
-
-### 7.3 Bài test sai lệch mô hình để chứng minh vai trò RBFNN
-
-Khi `arm_ff` quá khớp với nhiễu ảo, residual còn rất nhỏ nên RBFNN không có
-nhiều việc để làm. Để chứng minh RBFNN có đóng góp trong báo cáo, nên chạy thêm
-case model-mismatch: giữ nhiễu ảo thật như cũ nhưng cố tình giảm mô hình
-feedforward còn khoảng 70%.
-
-Tạo YAML mismatch từ YAML conservative:
-
-```bash
-python3 - <<'PY'
-from pathlib import Path
-import yaml
-
-src = Path("/home/wicom/uam_results/rbfnn_best_param_search_fffix_20260529_181119/yaml_conservation.yaml")
-dst = src.with_name("yaml_conservation_ff70.yaml")
-
-data = yaml.safe_load(src.read_text())
-params = data["uam_backstepping_rbfnn_node"]["ros__parameters"]
-
-for key in ("arm_ff_scale_roll", "arm_ff_scale_pitch", "arm_ff_scale_yaw"):
-    params[key] = float(params[key]) * 0.70
-
-dst.write_text(yaml.safe_dump(data, sort_keys=False))
-print(dst)
-PY
-```
-
-Chạy verification lại bằng YAML mismatch:
-
-```bash
-MISMATCH_CONFIG=/home/wicom/uam_results/rbfnn_best_param_search_fffix_20260529_181119/yaml_conservation_ff70.yaml
-
-ros2 run uam_controller run_rbfnn_verification_suite.py \
-  --config "$MISMATCH_CONFIG" \
-  --output-root /home/wicom/uam_results/rbfnn_verification_suite_ff70_$(date +%Y%m%d_%H%M%S) \
-  --pattern slow_step \
-  --duration-s 300 \
-  --amplitude 0.08 \
-  --rate-hz 5 \
-  --repeats 5 \
-  --include-strong
-```
-
-Kết quả mong muốn trong mismatch:
-
-- Case A xấu hơn do `arm_ff` không còn bù đủ.
-- Case B tốt hơn A về `rate_err_rms_radps`, `angle_rms_deg` hoặc XY.
-- `n_hat_norm_rms` của B lớn hơn run conservative gốc nhưng vẫn không drift.
-- Case C có thể tốt ở vài chỉ số, nhưng nếu thiếu `arm_ff` mà vẫn fail nhiều
-  thì kết luận đúng là RBFNN nên học residual chứ không thay toàn bộ mô hình.
-
-Đây là bài test hữu ích cho báo cáo vì nó trả lời câu hỏi: khi mô hình cánh tay
-không hoàn hảo, RBFNN có học phần sai lệch còn lại hay không.
-
-## 8. Kiểm tra topic quan trọng
-
-Các topic nên có trước khi tin rằng luồng external đã đúng:
-
-```bash
-ros2 topic echo /joint_states --once
-ros2 topic info /fmu/in/vehicle_torque_setpoint -v
-ros2 topic info /fmu/in/vehicle_thrust_setpoint -v
-ros2 topic echo /fmu/out/vehicle_status_v1 --once
-ros2 topic echo /fmu/out/vehicle_odometry --once
-```
-
-Nếu chạy chế độ mặc định `arm_state_source:=commanded`, `/joint_states` phải đổi
-theo lệnh `/arm_controller/joint_trajectory_plan` dù Gazebo arm không cử động.
-Nếu chạy `arm_state_source:=gazebo`, hãy kiểm tra bridge `arm_gazebo_joint_state_bridge.py`.
-
-## 9. Cleanup và chạy lại
-
-Khi muốn dừng sạch toàn bộ PX4 / Gazebo / ROS2:
-
-```bash
-cd ~/PX4-Autopilot/Tools/simulation/gz
-./tools/stop_uam_sim.sh
-```
-
-Script này sẽ:
-
-- gửi `SIGTERM` trước
-- chờ một khoảng thời gian
-- chỉ dùng `SIGKILL` nếu tiến trình vẫn còn sống
-
-## 10. Gợi ý thứ tự cho đồ án
-
-1. Tune PX4 baseline bằng `px4_pid_slider_tuner.py`.
-2. Chạy `internal_hover` để xác nhận UAV giữ được 2 m.
-3. Chạy `external_bs_hover` để xác nhận backstepping thay rate controller.
-4. Chạy `external_rbfnn_hover` với arm fixed.
-5. Chạy `external_rbfnn_arm_sin02` để bắt đầu tune RBFNN với disturbance nhẹ.
-6. Dùng `px4_uam_log_analyzer.py` để lấy số liệu và hình cho báo cáo.
-
-Cách chạy thủ công từng bước:
-
-**1. Dọn tiến trình cũ**
-
-```bash
-cd /home/wicom/PX4-Autopilot/Tools/simulation/gz
-./tools/stop_uam_sim.sh
-```
-
-**2. Build/source ROS2 nếu vừa sửa code**
+Build lại sau khi sửa code:
 
 ```bash
 cd /home/wicom/ros2_ws
 colcon build --packages-select uam_controller
-source /opt/ros/humble/setup.bash
 source /home/wicom/ros2_ws/install/setup.bash
 ```
 
-**3. Terminal 1: chạy PX4 + Gazebo**
+File launch chính:
+
+```text
+/home/wicom/ros2_ws/src/uam_controller/launch/uam_qgc_mode.launch.py
+```
+
+Các tham số launch quan trọng:
+
+| Tham số | Ý nghĩa |
+| --- | --- |
+| `sim:=true/false` | `true`: Gazebo SITL, `false`: phần cứng thật |
+| `config_file:=...yaml` | YAML tham số controller/arm |
+| `external_handoff_mode:=manual/auto` | `manual`: gọi service để bật external, `auto`: trigger tự bật sau hover ổn định |
+| `rbfnn_output_enable:=true/false` | bật/tắt output RBFNN trong controller |
+| `arm_ff_enable:=true/false` | bật/tắt feedforward torque từ mô hình cánh tay |
+| `arm_virtual_disturbance_enable:=true/false` | chỉ dùng mô phỏng để tiêm nhiễu cánh tay ảo vào plant |
+| `arm_state_source:=commanded/gazebo/external` | nguồn `/joint_states`: lệnh ảo, Gazebo joint, hoặc driver tay máy thật |
+| `use_gazebo_arm_visual:=true/false` | có gửi lệnh để nhìn arm Gazebo chuyển động hay không |
+| `start_xrce_agent:=true/false` | launch tự chạy MicroXRCEAgent hay agent đã chạy ngoài |
+| `xrce_serial_dev:=...` | cổng serial Micro XRCE-DDS khi `sim:=false` |
+
+YAML tốt hiện tại cho báo cáo Case B combined:
+
+```bash
+CASE_B_CONFIG=/home/wicom/uam_results/case_b_combined_ff_narrow_sweep_20260607_150103/configs/case_b_ff85_x030.yaml
+```
+
+Kết quả đẹp đang dùng cho báo cáo:
+
+```text
+Case B, combined_amp080, x030, trial 4
+Verdict: GOOD
+XY mean drift: 0.0395 m
+XY max drift : 0.0810 m
+Altitude RMSE: 0.0343 m
+Rate err RMS : 0.1020 rad/s
+```
+
+---
+
+# Phần A: Mô Phỏng Với QGC/Gazebo
+
+## A1. Dọn Mô Phỏng Cũ
+
+```bash
+cd /home/wicom/PX4-Autopilot/Tools/simulation/gz
+./tools/stop_uam_sim.sh
+```
+
+## A2. Terminal 1: Chạy PX4 SITL + Gazebo
 
 ```bash
 cd /home/wicom/PX4-Autopilot
 make px4_sitl gz_x500_hop
 ```
 
-Chờ Gazebo mở và PX4 boot xong. Trong PX4 shell, nếu muốn chạy external RBFNN rate controller:
+Nếu target `gz_x500_hop` không tồn tại sau khi clean build, kiểm tra lại model/airframe `x500_hop` trong PX4 tree trước khi chạy tiếp.
+
+Trong PX4 shell, chọn chế độ rate controller:
 
 ```bash
+# Baseline PX4 internal rate PID
+param set MC_RATE_EXT_EN 0
+
+# External ROS 2 backstepping/RBFNN rate controller
 param set MC_RATE_EXT_EN 1
-param set COM_RC_IN_MODE 4
 ```
 
 Kiểm tra:
@@ -586,13 +112,9 @@ Kiểm tra:
 param show MC_RATE_EXT_EN
 ```
 
-Nếu chỉ muốn baseline PX4 PID nội bộ thì để:
+## A3. Terminal 2: Chạy ROS 2 QGC Mode
 
-```bash
-param set MC_RATE_EXT_EN 0
-```
-
-**4. Terminal 2: chạy ROS2 controller stack**
+### Baseline, chưa thay rate controller
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -602,64 +124,54 @@ ros2 launch uam_controller uam_qgc_mode.launch.py \
   sim:=true \
   enable_rbfnn:=true \
   external_handoff_mode:=manual \
-  rbfnn_output_enable:=true \
-  arm_ff_enable:=true \
+  rbfnn_output_enable:=false \
+  arm_ff_enable:=false \
   arm_virtual_disturbance_enable:=false \
   arm_state_source:=commanded \
   use_gazebo_arm_visual:=false
 ```
 
-Ý nghĩa:
-- `enable_rbfnn:=true`: chạy node `uam_backstepping_rbfnn_node`.
+Với baseline thật sự, đặt `MC_RATE_EXT_EN=0` trong PX4 shell. ROS node có thể chạy để monitor/logger nhưng PX4 vẫn dùng PID nội bộ.
+
+### Case B báo cáo: Backstepping + RBFNN + FF + combined arm
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/wicom/ros2_ws/install/setup.bash
+
+CASE_B_CONFIG=/home/wicom/uam_results/case_b_combined_ff_narrow_sweep_20260607_150103/configs/case_b_ff85_x030.yaml
+REPORT_ROOT=/home/wicom/uam_results/manual_case_b_report_$(date +%Y%m%d_%H%M%S)
+
+ros2 launch uam_controller uam_qgc_mode.launch.py \
+  sim:=true \
+  config_file:=$CASE_B_CONFIG \
+  enable_rbfnn:=true \
+  external_handoff_mode:=manual \
+  rbfnn_output_enable:=true \
+  arm_ff_enable:=true \
+  arm_virtual_disturbance_enable:=true \
+  arm_state_source:=commanded \
+  use_gazebo_arm_visual:=false \
+  experiment_case:=case_b_rbfnn_ff_combined_amp080 \
+  experiment_output_root:=$REPORT_ROOT
+```
+
+Ý nghĩa cấu hình trên:
+
 - `rbfnn_output_enable:=true`: dùng Backstepping + RBFNN.
-- `arm_ff_enable:=true`: dùng `/arm/interaction_wrench` làm torque bù trong external controller.
-- `arm_virtual_disturbance_enable:=false`: không tiêm nhiễu cánh tay ảo vào UAV; dùng để kiểm tra controller với cấu hình bình thường.
-- `external_handoff_mode:=manual`: chưa tự bật external, phải gọi service sau khi UAV hover ổn định.
-- `arm_state_source:=commanded`: dùng cánh tay động học logic để tính nội lực, không dùng joint vật lý Gazebo.
-- `use_gazebo_arm_visual:=false`: không gửi lệnh sang mô hình arm Gazebo đang lỗi frame.
+- `arm_ff_enable:=true`: bật feedforward từ mô hình cánh tay.
+- `arm_virtual_disturbance_enable:=true`: mô phỏng plant bị nhiễu bởi cánh tay ảo. Chỉ dùng trong mô phỏng.
+- `arm_state_source:=commanded`: `/joint_states` được sinh từ lệnh khớp, không phụ thuộc arm Gazebo vật lý.
+- `use_gazebo_arm_visual:=false`: không gửi lệnh sang arm Gazebo, tránh lỗi frame/joint vật lý.
 
-Để kiểm tra UAV có thật sự “cảm” lực cánh tay ảo trong mô phỏng, bật nhiễu ảo:
+## A4. Điều Khiển Trong QGroundControl
 
-```bash
-arm_virtual_disturbance_enable:=true
-```
-
-Nếu muốn nhìn rõ nhiễu trước khi bù, chạy một lượt với:
-
-```bash
-arm_virtual_disturbance_enable:=true \
-arm_ff_enable:=false
-```
-
-Sau đó chạy lại với:
-
-```bash
-arm_virtual_disturbance_enable:=true \
-arm_ff_enable:=true
-```
-
-Lưu ý: khi không dùng joint vật lý Gazebo, nhiễu cánh tay không tự tác dụng lên
-plant. `arm_virtual_disturbance_enable:=true` là nhánh mô phỏng nhiễu đó bằng
-torque ảo; `arm_ff_enable:=true` là nhánh bù lại torque này.
-
-Nếu muốn chạy Backstepping không RBFNN:
-
-```bash
-rbfnn_output_enable:=false
-```
-
-**5. QGroundControl**
-
-Trong QGC:
-
-1. Chờ vehicle connected.
-2. Arm.
-3. Takeoff lên khoảng `2 m`.
-4. Giữ hover ổn định vài giây.
-
-**6. Terminal 3: bật external controller**
-
-Sau khi UAV đã hover ổn định:
+1. Mở QGroundControl.
+2. Chờ PX4 kết nối.
+3. Arm.
+4. Takeoff lên khoảng `2 m`.
+5. Giữ hover ổn định vài giây.
+6. Nếu dùng `external_handoff_mode:=manual`, gọi service để bật external controller.
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -668,67 +180,427 @@ source /home/wicom/ros2_ws/install/setup.bash
 ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
 ```
 
-Sau lệnh này, ROS2 bắt đầu publish:
+Sau khi external đã bật, chạy trajectory cánh tay combined:
 
-```text
-/fmu/in/vehicle_torque_setpoint
-/fmu/in/vehicle_thrust_setpoint
+```bash
+ros2 run uam_controller arm_trajectory_generator.py \
+  --pattern combined \
+  --duration 180 \
+  --amplitude 0.08 \
+  --rate 10
 ```
 
-PX4 `mc_rate_control` sẽ dùng external torque/thrust nếu `MC_RATE_EXT_EN=1` và dữ liệu còn mới.
+## A5. Chạy Kiểm Chứng Tự Động Case B Combined
 
-**7. Chạy chuyển động cánh tay nếu cần**
+Lệnh này tự chạy 7 repeat cho Case B combined:
 
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/wicom/ros2_ws/install/setup.bash
 
-ros2 run uam_controller arm_trajectory_generator.py \
-  --pattern slow_step \
-  --duration 120 \
-  --amplitude 0.02 \
-  --rate 5 \
-  --step-hold-time 15 \
-  --transition-time 5
+cd /home/wicom/PX4-Autopilot/Tools/simulation/gz
+
+CASE_B_CONFIG=/home/wicom/uam_results/case_b_combined_ff_narrow_sweep_20260607_150103/configs/case_b_ff85_x030.yaml
+
+ros2 run uam_controller run_rbfnn_verification_suite.py \
+  --config "$CASE_B_CONFIG" \
+  --output-root /home/wicom/uam_results/case_b_combined_report_$(date +%Y%m%d_%H%M%S) \
+  --cases B \
+  --pattern combined \
+  --duration-s 180 \
+  --amplitude 0.08 \
+  --rate-hz 10 \
+  --repeats 7
 ```
 
-**8. Theo dõi nhanh**
+Sau khi chạy xong, xem bảng median:
 
 ```bash
-ros2 topic echo /uam/debug_state
+cat /home/wicom/uam_results/<run>/combined_amp080/rbfnn_ab_comparison_combined_amp080_median.md
 ```
 
-hoặc:
+Tiêu chí chọn run đẹp cho báo cáo:
+
+- Verdict `GOOD` hoặc `OK`.
+- `xy_max_m` càng nhỏ càng tốt.
+- `angle_rms_deg` không vượt khoảng `1 deg` nhiều.
+- `rate_err_rms_radps` thấp.
+- `n_hat_norm_rms` khác 0 nhưng không drift tăng vô hạn.
+- `arm_ff_max_nm`, `tau_residual_rms_nm`, `ff_disturbance_dot_mean` có giá trị hợp lý.
+
+## A6. Tạo Bảng/Đồ Thị Kiểu ReviewPX4 Cho Báo Cáo
+
+Script bảng chi tiết:
 
 ```bash
-ros2 topic echo /joint_states
-ros2 topic echo /arm/interaction_wrench
-ros2 topic echo /fmu/in/vehicle_torque_setpoint
+/home/wicom/uam_results/ve_bang_tu_csv.py
 ```
 
-**Luồng chuẩn đề xuất**
+Chạy với trial mặc định đang dùng trong báo cáo:
+
+```bash
+python3 /home/wicom/uam_results/ve_bang_tu_csv.py
+```
+
+Chạy với CSV khác:
+
+```bash
+python3 /home/wicom/uam_results/ve_bang_tu_csv.py \
+  --csv /path/to/flight_timeseries.csv
+```
+
+Output nằm cạnh log:
 
 ```text
-Terminal 1: make px4_sitl gz_x500_hop
-PX4 shell : param set MC_RATE_EXT_EN 1
-Terminal 2: ros2 launch uam_controller uam_qgc_mode.launch.py sim:=true ...
-QGC       : arm + takeoff + hover 2 m
-Terminal 3: ros2 service call /uam/enable_external_controller ...
-Terminal 4: ros2 run uam_controller arm_trajectory_generator.py ...
+review_tables/
+  detailed_review_report.md
+  tables/
+    01_overview.png/csv
+    02_flight_performance.png/csv
+    03_controller_arm_rbfnn.png/csv
+    04_rbfnn_detail.png/csv
+    05_feedforward_detail.png/csv
+    06_axis_statistics.png/csv
+    07_joint_statistics.png/csv
+    08_data_health.png/csv
+  plots/
+    rbfnn_vs_rate_error_by_axis.png
+    ff_disturbance_residual_by_axis.png
+    ...
 ```
 
-Nếu UAV rung/mất ổn định, dừng external bằng cách kill ROS launch hoặc set:
+Các bảng quan trọng cho báo cáo:
+
+- `02_flight_performance`: lỗi vị trí, độ cao, attitude, rate.
+- `04_rbfnn_detail`: tham số và output `n_hat` của RBFNN.
+- `05_feedforward_detail`: FF, disturbance, residual, correlation, tỉ lệ FF/disturbance.
+- `06_axis_statistics`: thống kê từng trục.
+- `07_joint_statistics`: cử động từng khớp.
+
+## A7. So Sánh A/B/C/D Khi Cần Chứng Minh Đóng Góp RBFNN
+
+Các case:
+
+```text
+A: RBFNN off, FF on
+B: RBFNN on,  FF on
+C: RBFNN on,  FF off
+D: RBFNN off, FF off
+```
+
+Chạy suite đầy đủ:
 
 ```bash
-param set MC_RATE_EXT_EN 0
+ros2 run uam_controller run_rbfnn_verification_suite.py \
+  --config "$CASE_B_CONFIG" \
+  --output-root /home/wicom/uam_results/rbfnn_abcd_$(date +%Y%m%d_%H%M%S) \
+  --cases A,B,C,D \
+  --pattern combined \
+  --duration-s 180 \
+  --amplitude 0.08 \
+  --rate-hz 10 \
+  --repeats 7
 ```
 
-PX4 sẽ quay về rate PID nội bộ.Mặc dù đã thành công gửi lệnh rồi, nhưng có lỗi logic ở cánh tay, gửi Joint 1, 3, 4, 5, 6 thì không phản ứng gì, còn Joint 2 thì làm cả cánh tay (từ joint 2) bị tách ra khỏi UAV
+Đọc kết quả:
 
+```bash
+cat /home/wicom/uam_results/<suite>/combined_amp080/rbfnn_ab_comparison_combined_amp080_median.md
+```
 
-Draw the result:
-cd uam_results/
+Ghi nhớ: mục tiêu báo cáo hiện tại là Case B combined đẹp và ổn định. A/B/C/D dùng để phân tích đóng góp, không nhất thiết là cấu hình bay cuối cùng.
 
-export CSV=/home/wicom/uam_results/report_manual_tests/20260526_xxxxxx_report_manual_slow_step_amp002/flight_timeseries.csv
+## A8. Kiểm Tra Topic Trong Mô Phỏng
 
-python3 /home/wicom/uam_results/ve_bang_tu_csv.py
+```bash
+ros2 topic echo /joint_states --once
+ros2 topic echo /arm/interaction_wrench --once
+ros2 topic echo /fmu/out/vehicle_odometry --once
+ros2 topic info /fmu/in/vehicle_torque_setpoint -v
+ros2 topic info /fmu/in/vehicle_thrust_setpoint -v
+ros2 topic echo /uam/debug_state --once
+```
+
+Nếu dùng `arm_state_source:=commanded`, `/joint_states` phải đổi theo lệnh từ `arm_trajectory_generator.py`.
+
+---
+
+# Phần B: Chạy Thực Tế Với QGC/PX4
+
+Phần này dành cho Raspberry Pi 4B trên UAV thật kết nối PX4 thật qua Micro XRCE-DDS. QGroundControl vẫn là giao diện arm/takeoff/điều khiển chính.
+
+## B1. Nguyên Tắc An Toàn
+
+Trước khi bật external trên UAV thật:
+
+1. Test không gắn cánh quạt.
+2. Test QGC/PX4 baseline với `MC_RATE_EXT_EN=0`.
+3. Test ROS 2 topic và Micro XRCE-DDS ổn định.
+4. Test service `/uam/enable_external_controller` khi motor chưa chạy.
+5. Chỉ bật external sau khi hover ổn định.
+6. Luôn có RC/QGC kill switch và người giám sát.
+
+Không dùng trên UAV thật:
+
+```bash
+arm_virtual_disturbance_enable:=true
+```
+
+`arm_virtual_disturbance_enable` là nhiễu ảo để mô phỏng plant bị cánh tay tác động. Trên UAV thật, nhiễu đã tồn tại vật lý, không được tiêm thêm vào torque setpoint.
+
+## B2. Firmware/PX4 Cần Có
+
+PX4 thật cần:
+
+- uXRCE-DDS client bật và nối được với Raspberry Pi.
+- Topic `/fmu/out/vehicle_odometry`, `/fmu/out/vehicle_rates_setpoint` publish sang ROS 2.
+- Topic `/fmu/in/vehicle_torque_setpoint`, `/fmu/in/vehicle_thrust_setpoint` nhận từ ROS 2.
+- Nhánh external rate-control `MC_RATE_EXT_EN`.
+
+Kiểm tra/thay đổi tham số bằng QGC hoặc MAVLink shell:
+
+```bash
+param show MC_RATE_EXT_EN
+param set MC_RATE_EXT_EN 0   # bay baseline PX4 internal
+param set MC_RATE_EXT_EN 1   # cho phép external rate torque/thrust
+```
+
+Nếu PX4 không nhận ROS 2 setpoint, giữ `MC_RATE_EXT_EN=0` và kiểm tra XRCE trước.
+
+## B3. Raspberry Pi: Source Và Kiểm Tra Serial
+
+Trên Raspberry Pi:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/wicom/ros2_ws/install/setup.bash
+```
+
+Kiểm tra thiết bị serial:
+
+```bash
+ls -l /dev/ttyAMA0 /dev/ttyUSB0 /dev/ttyACM0
+```
+
+Thiết bị thường dùng:
+
+```text
+/dev/ttyAMA0  hoặc  /dev/ttyUSB0  hoặc  /dev/ttyACM0
+```
+
+Baudrate đang dùng mặc định:
+
+```text
+921600
+```
+
+## B4. Chạy ROS 2 Stack Cho UAV Thật
+
+Trường hợp Pi tự chạy Micro XRCE-DDS Agent:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/wicom/ros2_ws/install/setup.bash
+
+REAL_CONFIG=/home/wicom/ros2_ws/src/uam_controller/config/uam_controller_params.yaml
+REAL_REPORT_ROOT=/home/wicom/uam_results/real_qgc_$(date +%Y%m%d_%H%M%S)
+
+ros2 launch uam_controller uam_qgc_mode.launch.py \
+  sim:=false \
+  config_file:=$REAL_CONFIG \
+  start_xrce_agent:=true \
+  xrce_serial_dev:=/dev/ttyAMA0 \
+  xrce_baud:=921600 \
+  enable_rbfnn:=true \
+  external_handoff_mode:=manual \
+  rbfnn_output_enable:=true \
+  arm_ff_enable:=true \
+  arm_virtual_disturbance_enable:=false \
+  arm_state_source:=external \
+  use_gazebo_arm_visual:=false \
+  experiment_case:=real_qgc_case_b \
+  experiment_output_root:=$REAL_REPORT_ROOT
+```
+
+Nếu MicroXRCEAgent đã chạy bằng service/terminal khác:
+
+```bash
+ros2 launch uam_controller uam_qgc_mode.launch.py \
+  sim:=false \
+  config_file:=$REAL_CONFIG \
+  start_xrce_agent:=false \
+  enable_rbfnn:=true \
+  external_handoff_mode:=manual \
+  rbfnn_output_enable:=true \
+  arm_ff_enable:=true \
+  arm_virtual_disturbance_enable:=false \
+  arm_state_source:=external \
+  use_gazebo_arm_visual:=false \
+  experiment_case:=real_qgc_case_b \
+  experiment_output_root:=$REAL_REPORT_ROOT
+```
+
+Ý nghĩa riêng cho chạy thật:
+
+- `sim:=false`: dùng serial Micro XRCE-DDS thay vì UDP SITL.
+- `arm_virtual_disturbance_enable:=false`: không tiêm nhiễu ảo.
+- `arm_state_source:=external`: không chạy virtual/gazebo joint-state node; driver tay máy thật phải publish `/joint_states`.
+- `arm_ff_enable:=true`: dùng mô hình động lực học cánh tay để bù torque nếu `/joint_states` và `/arm/interaction_wrench` đúng.
+
+Nếu chưa có driver tay máy thật publish `/joint_states`, có thể dùng tạm:
+
+```bash
+arm_state_source:=commanded
+```
+
+Khi đó hệ tính lực/moment theo lệnh khớp, không phải trạng thái đo thật. Chỉ dùng để thử logic, không nên dùng làm kết luận bay thật cuối cùng.
+
+## B5. Kiểm Tra Topic Trước Khi Bay
+
+Trước khi arm:
+
+```bash
+ros2 topic echo /fmu/out/vehicle_status_v1 --once
+ros2 topic echo /fmu/out/vehicle_odometry --once
+ros2 topic echo /fmu/out/vehicle_rates_setpoint --once
+ros2 topic echo /joint_states --once
+ros2 topic echo /arm/interaction_wrench --once
+ros2 topic info /fmu/in/vehicle_torque_setpoint -v
+ros2 topic info /fmu/in/vehicle_thrust_setpoint -v
+```
+
+Kỳ vọng:
+
+- `/fmu/out/...` có dữ liệu mới.
+- `/joint_states` đúng 6 khớp và không bị stale.
+- `/arm/interaction_wrench` khác 0 khi tay máy chuyển động.
+- `/fmu/in/vehicle_torque_setpoint` và `/fmu/in/vehicle_thrust_setpoint` có publisher từ controller.
+
+## B6. Quy Trình Bay Thật Qua QGC
+
+1. Đặt `MC_RATE_EXT_EN=0`.
+2. Arm/takeoff bằng QGC, kiểm tra PX4 internal hover trước.
+3. Land, kiểm tra log/topic nếu baseline chưa ổn.
+4. Khi baseline ổn, đặt `MC_RATE_EXT_EN=1`.
+5. Takeoff bằng QGC, hover khoảng `2 m`.
+6. Chỉ sau khi hover ổn định, bật external:
+
+```bash
+ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger
+```
+
+7. Cho tay máy chạy trajectory đơn giản, biên độ nhỏ trước.
+8. Nếu attitude/XY/altitude xấu, tắt external hoặc land ngay.
+
+## B7. Chạy Tay Máy Thật
+
+Nếu tay máy thật đã có driver ROS 2, driver cần:
+
+- nhận lệnh joint trajectory hoặc lệnh riêng của arm controller,
+- publish `/joint_states` với 6 khớp,
+- đồng bộ tên/thứ tự khớp với mô hình động lực học,
+- đảm bảo timestamp/frequency đủ mới cho `arm_dynamics_node.py`.
+
+Kiểm tra `/joint_states`:
+
+```bash
+ros2 topic hz /joint_states
+ros2 topic echo /joint_states --once
+```
+
+Nếu cần chạy lệnh cánh tay dạng combined trong ROS 2:
+
+```bash
+ros2 run uam_controller arm_trajectory_generator.py \
+  --pattern combined \
+  --duration 180 \
+  --amplitude 0.03 \
+  --rate 10
+```
+
+Với UAV thật, bắt đầu từ biên độ nhỏ hơn mô phỏng, ví dụ `0.02-0.03 rad`, rồi tăng dần sau khi log ổn.
+
+## B8. Log Và Bảng Kết Quả Chạy Thật
+
+Logger tạo:
+
+```text
+$REAL_REPORT_ROOT/<timestamp>_<case>/
+  flight_timeseries.csv
+  metadata.json
+  summary.json
+  summary.md
+```
+
+Tạo bảng chi tiết:
+
+```bash
+python3 /home/wicom/uam_results/ve_bang_tu_csv.py \
+  --csv /path/to/real_flight/flight_timeseries.csv
+```
+
+Các bảng cần xem:
+
+- `02_flight_performance`: UAV có giữ altitude/XY/attitude không.
+- `04_rbfnn_detail`: output `n_hat` có hợp lý không.
+- `05_feedforward_detail`: FF có cùng chiều disturbance không, residual có giảm không.
+- `08_data_health`: topic có stale hay mất dữ liệu không.
+
+## B9. Debug Nhanh Khi Chạy Thật
+
+Nếu QGC/PX4 không thấy ROS 2:
+
+```bash
+pgrep -af MicroXRCEAgent
+ros2 topic list | sort
+```
+
+Nếu external không tác dụng:
+
+```bash
+param show MC_RATE_EXT_EN
+ros2 topic echo /uam/debug_state --once
+ros2 topic info /fmu/in/vehicle_torque_setpoint -v
+```
+
+Nếu tay máy không tạo lực/moment:
+
+```bash
+ros2 topic echo /joint_states --once
+ros2 topic echo /arm/interaction_wrench --once
+```
+
+Nếu dữ liệu bị stale:
+
+```bash
+ros2 topic hz /fmu/out/vehicle_odometry
+ros2 topic hz /fmu/out/vehicle_rates_setpoint
+ros2 topic hz /joint_states
+```
+
+## B10. Cấu Hình Khuyến Nghị Khi Bảo Vệ
+
+Mô phỏng báo cáo:
+
+```bash
+config_file:=/home/wicom/uam_results/case_b_combined_ff_narrow_sweep_20260607_150103/configs/case_b_ff85_x030.yaml
+rbfnn_output_enable:=true
+arm_ff_enable:=true
+arm_virtual_disturbance_enable:=true
+arm_state_source:=commanded
+use_gazebo_arm_visual:=false
+```
+
+Chạy thật ban đầu:
+
+```bash
+config_file:=/home/wicom/ros2_ws/src/uam_controller/config/uam_controller_params.yaml
+rbfnn_output_enable:=true
+arm_ff_enable:=true
+arm_virtual_disturbance_enable:=false
+arm_state_source:=external
+use_gazebo_arm_visual:=false
+external_handoff_mode:=manual
+```
+
+Không dùng kết quả mô phỏng virtual disturbance để khẳng định trực tiếp bay thật. Với bay thật, phải dựa trên log thật: `/joint_states`, `/arm/interaction_wrench`, attitude/rate/XY/altitude và fallback behavior của PX4.
