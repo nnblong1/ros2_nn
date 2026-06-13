@@ -209,12 +209,20 @@ uam_adaptive_controller:
     rate_Kp_pitch: 0.09
     rate_Kp_roll: 0.09
     rate_Kp_yaw: 0.055
+    base_offset_enable: false
+    external_torque_ramp_s: 5.0
+    external_torque_limit_initial: 0.03
+    external_torque_limit_final: 0.35
+    external_torque_rate_limit_norm_s: 0.40
+    external_safety_tilt_deg: 30.0
+    external_safety_rate_rad_s: 2.5
     rbfnn_enable: true
     rbfnn_num_neurons: 45
     rbfnn_lr: 0.004
     rbfnn_gaussian_width: 3.0
     rbfnn_e_modification: 0.035
     rbfnn_output_gain: 0.5
+    allow_external_torque_output: true
     arm_ff_enable: false
     arm_ff_start_delay_s: 1.0
     arm_ff_ramp_s: 5.0
@@ -247,10 +255,16 @@ uam_mission_bridge:
   ros__parameters:
     cruise_speed: 2.0
     auto_enable_external_controller: false
+    allow_external_torque_handoff: true
     loop_rate_hz: 20.0
     offboard_prime_duration_s: 3.0
     position_threshold: 0.25
     require_local_position_ready: true
+    require_heading_good_for_control: false
+    external_handoff_stable_time_s: 5.0
+    external_handoff_max_position_error_m: 0.30
+    external_handoff_max_horizontal_speed_ms: 0.20
+    external_handoff_max_vertical_speed_ms: 0.12
     takeoff_height: -2.0
 uam_telemetry_monitor:
   ros__parameters:

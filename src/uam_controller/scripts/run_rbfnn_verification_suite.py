@@ -401,7 +401,14 @@ def main() -> int:
     config = config.resolve()
 
     if not (args.gz_root / "tools" / "uam_rerun_autotune.py").exists():
-        print(f"Missing uam_rerun_autotune.py under {args.gz_root}", file=sys.stderr)
+        print(
+            "Missing custom autotune tool: "
+            f"{args.gz_root / 'tools' / 'uam_rerun_autotune.py'}\n"
+            "The current PX4 v1.16.2-rbfnn Gazebo submodule does not include this thesis-specific script. "
+            "Use the stable QGC/PX4 v1.16.2-rbfnn launch path, or restore/port the legacy autotune tool "
+            "before running this verification suite.",
+            file=sys.stderr,
+        )
         return 2
 
     if args.output_root is None:

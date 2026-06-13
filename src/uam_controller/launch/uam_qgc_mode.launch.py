@@ -5,22 +5,24 @@ Chạy UAM system với QGroundControl làm giao diện điều khiển chính.
 
 KHÁC BIỆT VỚI uam_system.launch.py:
   - KHÔNG chạy uam_mission_bridge  → QGC đảm nhận arm/takeoff/waypoints
-  - Có thể chạy external rate controller qua MC_RATE_EXT_EN của PX4
-  - Vẫn chạy arm nodes             → Gazebo arm control vẫn hoạt động
+  - Dùng firmware custom PX4 v1.16.2-rbfnn: PX4 giữ position/attitude loop,
+    ROS backstepping+RBFNN thay mc_rate_control sau khi handoff
+  - Vẫn chạy arm nodes             → Gazebo arm control hoạt động với model x500_hop
 
 LUỒNG ĐIỀU KHIỂN VỚI QGC:
   1. Chạy lệnh này để khởi động ROS 2 nodes + DDS Agent
   2. Mở terminal riêng: cd ~/PX4-Autopilot && make px4_sitl gz_x500_hop
   3. QGC tự kết nối qua UDP:14550
   4. Arm bằng QGC → Takeoff → giữ hover 2m ổn định
-  5. Nếu MC_RATE_EXT_EN=1 và enable_rbfnn=true, trigger sẽ tự bật external rate controller sau hover ổn định
+  5. Trigger bật external controller thủ công hoặc tự động sau hover ổn định
 
 CHẾ ĐỘ BAY:
-  - enable_rbfnn=false                → PX4 internal controller hoàn toàn
-  - enable_rbfnn=true + MC_RATE_EXT_EN=0
-                                     → ROS node chạy nhưng PX4 vẫn dùng internal rate controller
-  - enable_rbfnn=true + MC_RATE_EXT_EN=1
-                                     → sau hover ổn định, ROS node thay rate controller bằng torque/thrust external
+  - MC_RATE_EXT_EN=1 trong airframe gz_x500_hop:
+      PX4 fallback về rate PID nội bộ khi ROS chưa publish torque mới.
+  - external_handoff_mode:=manual:
+      sau hover ổn định, gọi /uam/enable_external_controller để bắt đầu bypass.
+  - external_handoff_mode:=auto:
+      tự bật bypass sau hover ổn định.
 
 Cách dùng:
   # Gazebo SITL
@@ -50,6 +52,7 @@ Cách dùng:
   - Nếu YAML nằm trong src sau khi sửa code/package, build lại rồi source workspace:
     colcon build --packages-select uam_controller
     source /home/wicom/ros2_ws/install/setup.bash
+  - Dùng nhánh PX4 px4-v1.16.2-rbfnn và target gz_x500_hop để có model arm custom.
 
   # Phần cứng thật
   ros2 launch uam_controller uam_qgc_mode.launch.py sim:=false xrce_serial_dev:=/dev/ttyACM0
@@ -101,7 +104,13 @@ def generate_launch_description():
     arg_handoff_mode = DeclareLaunchArgument(
         'external_handoff_mode',
         default_value='manual',
-        description='manual = chờ gọi service để chuyển sang external | auto = tự bật sau hover ổn định'
+        description='manual = chờ service sau hover | auto = tự bật bypass sau hover ổn định'
+    )
+
+    arg_allow_external_torque_handoff = DeclareLaunchArgument(
+        'allow_external_torque_handoff',
+        default_value='true',
+        description='true = cho phép ROS publish torque/thrust khi trigger enable; false = chỉ monitor/log.'
     )
 
     arg_rbfnn_output_enable = DeclareLaunchArgument(
@@ -148,7 +157,7 @@ def generate_launch_description():
 
     arg_experiment_output_root = DeclareLaunchArgument(
         'experiment_output_root',
-        default_value='/home/wicom/PX4-Autopilot/Tools/simulation/gz/pid_search_results/uam_verification',
+        default_value='/home/wicom/uam_results/uam_verification',
         description='Thư mục gốc để lưu kết quả kiểm chứng'
     )
 
@@ -180,6 +189,7 @@ def generate_launch_description():
     config_file  = LaunchConfiguration('config_file')
     enable_rbfnn = LaunchConfiguration('enable_rbfnn')
     handoff_mode = LaunchConfiguration('external_handoff_mode')
+    allow_external_torque_handoff = LaunchConfiguration('allow_external_torque_handoff')
     rbfnn_output_enable = LaunchConfiguration('rbfnn_output_enable')
     arm_ff_enable = LaunchConfiguration('arm_ff_enable')
     arm_virtual_disturbance_enable = LaunchConfiguration('arm_virtual_disturbance_enable')
@@ -228,6 +238,10 @@ def generate_launch_description():
             config_file,
             {
                 'rbfnn_enable': ParameterValue(rbfnn_output_enable, value_type=bool),
+                'allow_external_torque_output': ParameterValue(
+                    allow_external_torque_handoff,
+                    value_type=bool,
+                ),
                 'arm_ff_enable': ParameterValue(arm_ff_enable, value_type=bool),
                 'arm_virtual_disturbance_enable': ParameterValue(
                     arm_virtual_disturbance_enable,
@@ -363,7 +377,11 @@ def generate_launch_description():
             'require_manual_confirmation': ParameterValue(
                 PythonExpression(["'", handoff_mode, "' == 'manual'"]),
                 value_type=bool,
-            )
+            ),
+            'allow_external_torque_handoff': ParameterValue(
+                allow_external_torque_handoff,
+                value_type=bool,
+            ),
         }],
         condition=IfCondition(enable_rbfnn)
     )
@@ -390,11 +408,9 @@ def generate_launch_description():
             '║    • Kéo Arm để khởi động động cơ                        ║\n'
             '║    • Đẩy ga Takeoff (Position Mode / Altitude Mode)      ║\n'
             '║                                                          ║\n'
-            '║  External rate controller chỉ hoạt động khi:             ║\n'
-            '║    • enable_rbfnn=true                                    ║\n'
-            '║    • MC_RATE_EXT_EN=1 trong PX4                           ║\n'
-            '║    • hover ổn định đủ thời gian trigger                   ║\n'
-            '║    • manual mode: gọi /uam/enable_external_controller     ║\n'
+            '║  Firmware: px4-v1.16.2-rbfnn, MC_RATE_EXT_EN=1           ║\n'
+            '║  ROS chỉ publish torque sau khi trigger hover bật enable. ║\n'
+            '║  Manual: gọi /uam/enable_external_controller sau hover.   ║\n'
             '╚══════════════════════════════════════════════════════════╝'
         )
     )
@@ -425,6 +441,7 @@ def generate_launch_description():
         arg_config,
         arg_rbfnn,
         arg_handoff_mode,
+        arg_allow_external_torque_handoff,
         arg_rbfnn_output_enable,
         arg_arm_ff_enable,
         arg_arm_virtual_disturbance_enable,

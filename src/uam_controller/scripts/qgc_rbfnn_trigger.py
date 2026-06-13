@@ -16,6 +16,7 @@ class QGCRBFNNTrigger(Node):
         self.declare_parameter('stable_hover_time_s', 3.0)
         self.declare_parameter('min_arm_time_s', 2.0)
         self.declare_parameter('require_manual_confirmation', True)
+        self.declare_parameter('allow_external_torque_handoff', True)
 
         self.enable_height_m = float(self.get_parameter('enable_height_m').value)
         self.vertical_speed_max_ms = float(self.get_parameter('vertical_speed_max_ms').value)
@@ -23,6 +24,9 @@ class QGCRBFNNTrigger(Node):
         self.stable_hover_time_s = float(self.get_parameter('stable_hover_time_s').value)
         self.min_arm_time_s = float(self.get_parameter('min_arm_time_s').value)
         self.require_manual_confirmation = bool(self.get_parameter('require_manual_confirmation').value)
+        self.allow_external_torque_handoff = bool(
+            self.get_parameter('allow_external_torque_handoff').value
+        )
 
         self.sub_odom = self.create_subscription(
             VehicleOdometry,
@@ -65,6 +69,7 @@ class QGCRBFNNTrigger(Node):
         self.stable_counter = 0
         self.hover_ready = False
         self.enable_requested = False
+        self.handoff_block_warned = False
 
         if self.require_manual_confirmation:
             self.get_logger().info(
@@ -75,6 +80,11 @@ class QGCRBFNNTrigger(Node):
             self.get_logger().info(
                 'QGC trigger started in auto handoff mode. '
                 'External controller will be enabled automatically after stable hover.'
+            )
+        if not self.allow_external_torque_handoff:
+            self.get_logger().warn(
+                'External torque handoff is disabled by launch/config. '
+                'The trigger will monitor stable hover but will not publish /uam/controller_enable=true.'
             )
 
     def odom_cb(self, msg):
@@ -89,11 +99,12 @@ class QGCRBFNNTrigger(Node):
         armed = (msg.arming_state == armed_state)
         if armed and not self.armed:
             self.arm_time = self.get_clock().now().nanoseconds / 1e9
-            self.get_logger().info('Vehicle armed. Waiting for stable hover before external-controller handoff.')
+            self.get_logger().info('Vehicle armed. Waiting for stable hover before optional external torque handoff.')
         if not armed and self.armed:
-            self.get_logger().info('Vehicle disarmed. External rate controller gate reset.')
+            self.get_logger().info('Vehicle disarmed. External torque handoff gate reset.')
             self.hover_ready = False
             self.enable_requested = False
+            self.handoff_block_warned = False
         self.armed = armed
         self.nav_state = msg.nav_state
 
@@ -110,6 +121,14 @@ class QGCRBFNNTrigger(Node):
         if self.controller_enabled:
             response.success = True
             response.message = 'External controller is already enabled.'
+            return response
+
+        if not self.allow_external_torque_handoff:
+            response.success = False
+            response.message = (
+                'External torque handoff is disabled by allow_external_torque_handoff=false. '
+                'Use allow_external_torque_handoff:=true with the custom PX4 v1.16.2-rbfnn firmware.'
+            )
             return response
 
         if not self.hover_ready:
@@ -132,8 +151,8 @@ class QGCRBFNNTrigger(Node):
         self.controller_enabled = False
         self.enable_requested = False
         response.success = True
-        response.message = 'External controller disabled. PX4 internal fallback remains active.'
-        self.get_logger().info('Manual request received. External rate controller disabled.')
+        response.message = 'External controller disabled. PX4 internal control remains active.'
+        self.get_logger().info('Manual request received. External torque handoff disabled.')
         return response
 
     def loop(self):
@@ -161,16 +180,30 @@ class QGCRBFNNTrigger(Node):
                 if not self.hover_ready and self.stable_counter * 0.1 >= self.stable_hover_time_s:
                     self.hover_ready = True
                     if self.require_manual_confirmation:
-                        self.get_logger().info(
-                            f"Stable hover detected at {abs(self.z):.2f} m. "
-                            "Call /uam/enable_external_controller to switch to external mode."
-                        )
+                        if self.allow_external_torque_handoff:
+                            self.get_logger().info(
+                                f"Stable hover detected at {abs(self.z):.2f} m. "
+                                "Call /uam/enable_external_controller to switch to external mode."
+                            )
+                        elif not self.handoff_block_warned:
+                            self.handoff_block_warned = True
+                            self.get_logger().warn(
+                                f"Stable hover detected at {abs(self.z):.2f} m, "
+                                "but external torque handoff is disabled by launch/config."
+                            )
                     else:
-                        self.enable_requested = True
-                        self.controller_enabled = True
-                        self.get_logger().info(
-                            f"Stable hover detected at {abs(self.z):.2f} m. Enabling external rate controller."
-                        )
+                        if self.allow_external_torque_handoff:
+                            self.enable_requested = True
+                            self.controller_enabled = True
+                            self.get_logger().info(
+                                f"Stable hover detected at {abs(self.z):.2f} m. Enabling external torque controller."
+                            )
+                        elif not self.handoff_block_warned:
+                            self.handoff_block_warned = True
+                            self.get_logger().warn(
+                                f"Stable hover detected at {abs(self.z):.2f} m, "
+                                "but external torque handoff is disabled by launch/config."
+                            )
             else:
                 if self.hover_ready:
                     self.get_logger().warn(

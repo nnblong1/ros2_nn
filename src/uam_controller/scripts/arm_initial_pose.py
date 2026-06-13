@@ -3,6 +3,7 @@
 arm_initial_pose.py
 -------------------
 Gửi tư thế "co tay" ban đầu tới cánh tay robot khi khởi động.
+Chỉ dùng cho model custom x500_hop đã port sang PX4 v1.16.2/GZ.
 
 Cách tiếp cận: Gọi trực tiếp `gz topic -p` cho TỪNG khớp một (sequential),
 BYPASS hoàn toàn bridge ROS2 để tránh ZeroMQ buffer drop.

@@ -134,6 +134,19 @@ private:
     double arm_cg_max_norm_ = 0.04;
     double arm_cg_lpf_alpha_ = 0.1;
     Eigen::Vector2d arm_cg_bias_norm_ = Eigen::Vector2d::Zero();
+    bool base_offset_enabled_ = false;
+
+    double external_torque_ramp_s_ = 5.0;
+    double external_torque_limit_initial_ = 0.03;
+    double external_torque_limit_final_ = 0.35;
+    double external_torque_rate_limit_norm_s_ = 0.40;
+    double external_safety_tilt_rad_ = 0.52; // about 30 deg
+    double external_safety_rate_rad_s_ = 2.5;
+    Eigen::Vector3d last_tau_norm_pub_ = Eigen::Vector3d::Zero();
+    double attitude_roll_rad_ = 0.0;
+    double attitude_pitch_rad_ = 0.0;
+    bool external_handoff_fault_ = false;
+    bool warned_external_handoff_fault_ = false;
 
     // ★ RBFNN Ramp-up Strategy: Cho phép RBFNN học từ đầu, output tăng dần
     double controller_start_time_ = -1.0;      // Thời điểm controller được enable lần đầu
@@ -159,6 +172,8 @@ private:
     bool has_arm_wrench_ = false;
     bool controller_enabled_ = false;
     bool rbfnn_output_enabled_ = false;
+    bool external_torque_output_allowed_ = true;
+    bool warned_external_torque_blocked_ = false;
     double rbfnn_output_gain_ = 0.5;
     uint64_t px4_timestamp_ = 0;
     

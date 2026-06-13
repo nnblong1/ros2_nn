@@ -392,6 +392,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not (args.gz_root / "tools/uam_rerun_autotune.py").exists():
+        print(
+            "Missing custom autotune tool: "
+            f"{args.gz_root / 'tools/uam_rerun_autotune.py'}\n"
+            "The current PX4 v1.16.2-rbfnn Gazebo submodule does not include this thesis-specific script. "
+            "Use the stable QGC/PX4 v1.16.2-rbfnn launch path, or restore/port the legacy autotune tool "
+            "before running robust Case D selection.",
+            file=sys.stderr,
+        )
+        return 2
     args.output_root.mkdir(parents=True, exist_ok=True)
     candidates = candidate_paths(args)
     if not candidates:

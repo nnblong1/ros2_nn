@@ -4,7 +4,8 @@ uam_system.launch.py
 Khởi động toàn bộ hệ thống UAM.
 
 NGUYÊN TẮC THIẾT KẾ:
-  - File này KHÔNG định nghĩa bất kỳ giá trị tham số nào.
+  - Dùng firmware custom PX4 v1.16.2-rbfnn để giữ PX4 position/attitude loop
+    và cho ROS backstepping+RBFNN thay mc_rate_control sau handoff.
   - Mọi tham số điều khiển nằm trong:
       config/uam_controller_params.yaml   (mặc định)
       config/uam_controller_params_sim.yaml   (khi sim:=true)
@@ -17,6 +18,12 @@ Cách dùng:
 
   # Chạy Gazebo SITL
   ros2 launch uam_controller uam_system.launch.py sim:=true
+
+  # Tắt bypass để bay so sánh bằng PX4 internal rate PID
+  ros2 launch uam_controller uam_system.launch.py sim:=true allow_external_torque_handoff:=false
+
+  # Tự bật backstepping+RBFNN sau khi takeoff xong và chuyển sang HOLD/GOTO
+  ros2 launch uam_controller uam_system.launch.py sim:=true auto_enable_external_controller:=true
 
   # Chỉ định file config khác
   ros2 launch uam_controller uam_system.launch.py \\
@@ -41,6 +48,7 @@ from launch.substitutions import (
     PythonExpression,
 )
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -50,10 +58,12 @@ def generate_launch_description():
 
     # ═══════════════════════════════════════════════════════════
     #  KHAI BÁO ARGUMENT
-    #  Chỉ có 3 loại argument hợp lệ ở đây:
+    #  Chỉ có 5 loại argument hợp lệ ở đây:
     #    1. Chọn môi trường (sim / hardware)
     #    2. Chọn file config
-    #    3. Chọn file model (phụ thuộc đường dẫn máy)
+    #    3. Chọn cho phép torque handoff sang ROS backstepping+RBFNN
+    #    4. Chọn tự bật controller ngoài sau HOLD/GOTO
+    #    5. Chọn file model (phụ thuộc đường dẫn máy)
     # ═══════════════════════════════════════════════════════════
 
     arg_sim = DeclareLaunchArgument(
@@ -70,8 +80,22 @@ def generate_launch_description():
         description='Đường dẫn file YAML chứa toàn bộ tham số hệ thống'
     )
 
+    arg_allow_external_torque_handoff = DeclareLaunchArgument(
+        'allow_external_torque_handoff',
+        default_value='true',
+        description='true = cho phép ROS publish torque/thrust khi mission bridge enable; false = chỉ PX4 internal rate PID.'
+    )
+
+    arg_auto_enable_external_controller = DeclareLaunchArgument(
+        'auto_enable_external_controller',
+        default_value='false',
+        description='true = mission bridge publish /uam/controller_enable=true sau khi vào HOLD/GOTO.'
+    )
+
     sim         = LaunchConfiguration('sim')
     config_file = LaunchConfiguration('config_file')
+    allow_external_torque_handoff = LaunchConfiguration('allow_external_torque_handoff')
+    auto_enable_external_controller = LaunchConfiguration('auto_enable_external_controller')
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 0 – Micro XRCE-DDS Agent
@@ -96,8 +120,7 @@ def generate_launch_description():
 
     # ═══════════════════════════════════════════════════════════
     #  NODE 1 – Adaptive Backstepping + RBFNN  (C++, 100 Hz)
-    #  Tham số: ĐỌC HOÀN TOÀN từ config_file
-    #  Không có parameters=[{...}] inline ở đây
+    #  Tham số: đọc từ config_file, sau đó launch override cổng torque handoff
     # ═══════════════════════════════════════════════════════════
 
     backstepping_node = Node(
@@ -105,7 +128,15 @@ def generate_launch_description():
         executable='uam_backstepping_rbfnn_node',
         name='uam_adaptive_controller',
         output='screen',
-        parameters=[config_file],   # ← duy nhất, không thêm gì nữa
+        parameters=[
+            config_file,
+            {
+                'allow_external_torque_output': ParameterValue(
+                    allow_external_torque_handoff,
+                    value_type=bool,
+                ),
+            }
+        ],
         remappings=[
             ('/fmu/in/offboard_control_mode',   '/fmu/in/offboard_control_mode'),
             ('/fmu/in/vehicle_torque_setpoint',  '/fmu/in/vehicle_torque_setpoint'),
@@ -182,7 +213,19 @@ def generate_launch_description():
         executable='uam_mission_bridge.py',
         name='uam_mission_bridge',
         output='screen',
-        parameters=[config_file]
+        parameters=[
+            config_file,
+            {
+                'allow_external_torque_handoff': ParameterValue(
+                    allow_external_torque_handoff,
+                    value_type=bool,
+                ),
+                'auto_enable_external_controller': ParameterValue(
+                    auto_enable_external_controller,
+                    value_type=bool,
+                ),
+            }
+        ]
     )
 
     telemetry_node = Node(
@@ -216,6 +259,8 @@ def generate_launch_description():
         # Arguments
         arg_sim,
         arg_config,
+        arg_allow_external_torque_handoff,
+        arg_auto_enable_external_controller,
         # DDS bridge (khởi động ngay)
         xrce_hardware,
         xrce_sim,

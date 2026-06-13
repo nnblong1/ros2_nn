@@ -2,9 +2,8 @@
 """
 Bridge Gazebo transport joint states to ROS 2 /joint_states.
 
-The x500_hop SDF uses Gazebo's JointStatePublisher, which publishes a
-gz.msgs.Model message. The controller stack expects sensor_msgs/JointState on
-/joint_states, so this node performs the small conversion directly.
+This bridge is only for the custom arm-equipped x500_hop model. Keep this node
+off when running a non-arm PX4 model such as gz_x500.
 """
 
 import time

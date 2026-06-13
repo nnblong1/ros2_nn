@@ -39,9 +39,9 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
-# ── Launch, Config, Models ──
+# ── Launch, Config, Models, Docs ──
 install(DIRECTORY
-  launch config models
+  launch config models docs
   DESTINATION share/${PROJECT_NAME}
 )
 

@@ -49,7 +49,8 @@ class ArmGazeboCommandNode(Node):
     def __init__(self):
         super().__init__('arm_gazebo_command_node')
 
-        # Match x500_hop/model.sdf JointPositionController topics.
+        # Match the custom x500_hop/model.sdf JointPositionController topics.
+        # Disable this bridge when running a non-arm PX4 model such as gz_x500.
         self.declare_parameter('model_prefix', 'model/x500_hop')
         self.declare_parameter('command_topic', '/arm_controller/joint_trajectory_plan')
         self.declare_parameter('state_topic', '/joint_states')

@@ -113,6 +113,7 @@ void UAMAdaptiveController::declare_params() {
     declare_parameter("rbfnn_gaussian_width", rbfnn_params_.gaussian_width);
     declare_parameter("rbfnn_e_modification", rbfnn_params_.e_modification);
     declare_parameter("rbfnn_output_gain", rbfnn_output_gain_);
+    declare_parameter("allow_external_torque_output", true);
 
     declare_parameter("rate_Kp_roll", rate_gains_.K_roll);
     declare_parameter("rate_Kp_pitch", rate_gains_.K_pitch);
@@ -125,6 +126,13 @@ void UAMAdaptiveController::declare_params() {
     declare_parameter("rate_Kd_yaw", rate_gains_.Kd_yaw);
     declare_parameter("base_pitch_offset", 0.0);
     declare_parameter("base_roll_offset", 0.0);
+    declare_parameter("base_offset_enable", false);
+    declare_parameter("external_torque_ramp_s", external_torque_ramp_s_);
+    declare_parameter("external_torque_limit_initial", external_torque_limit_initial_);
+    declare_parameter("external_torque_limit_final", external_torque_limit_final_);
+    declare_parameter("external_torque_rate_limit_norm_s", external_torque_rate_limit_norm_s_);
+    declare_parameter("external_safety_tilt_deg", 30.0);
+    declare_parameter("external_safety_rate_rad_s", external_safety_rate_rad_s_);
     declare_parameter("joint_kp", 50.0);
     declare_parameter("joint_kd", 5.0);
     declare_parameter("tau_max_roll_nm", sys_.max_torque);
@@ -169,6 +177,7 @@ void UAMAdaptiveController::declare_params() {
     sys_.max_joint_tau= get_parameter("max_joint_tau").as_double();
     sys_.gravity      = get_parameter("gravity").as_double();
     rbfnn_output_enabled_ = get_parameter("rbfnn_enable").as_bool();
+    external_torque_output_allowed_ = get_parameter("allow_external_torque_output").as_bool();
 
     // ★ FIX #1: Đọc rbfnn_lr từ YAML vào rbfnn_params_ TRƯỚC KHI khởi tạo RBFNN
     declare_parameter("rbfnn_lr", rbfnn_params_.learning_rate);
@@ -181,13 +190,14 @@ void UAMAdaptiveController::declare_params() {
     rbfnn_output_gain_ = std::clamp(get_parameter("rbfnn_output_gain").as_double(), 0.0, 1.0);
     RCLCPP_INFO(
         get_logger(),
-        "RBFNN params: input_dim=%d, neurons=%d, lr=%.5f, width=%.3f, e_mod=%.4f, output_gain=%.3f",
+        "RBFNN params: input_dim=%d, neurons=%d, lr=%.5f, width=%.3f, e_mod=%.4f, output_gain=%.3f, torque_output_allowed=%s",
         rbfnn_params_.input_dim,
         rbfnn_params_.num_neurons,
         rbfnn_params_.learning_rate,
         rbfnn_params_.gaussian_width,
         rbfnn_params_.e_modification,
-        rbfnn_output_gain_);
+        rbfnn_output_gain_,
+        external_torque_output_allowed_ ? "true" : "false");
 
     rate_gains_.K_roll  = get_parameter("rate_Kp_roll").as_double();
     rate_gains_.K_pitch = get_parameter("rate_Kp_pitch").as_double();
@@ -200,6 +210,14 @@ void UAMAdaptiveController::declare_params() {
     rate_gains_.Kd_yaw   = get_parameter("rate_Kd_yaw").as_double();
     base_pitch_offset_  = get_parameter("base_pitch_offset").as_double();
     base_roll_offset_   = get_parameter("base_roll_offset").as_double();
+    base_offset_enabled_ = get_parameter("base_offset_enable").as_bool();
+    external_torque_ramp_s_ = std::max(0.1, get_parameter("external_torque_ramp_s").as_double());
+    external_torque_limit_initial_ = std::clamp(get_parameter("external_torque_limit_initial").as_double(), 0.0, 1.0);
+    external_torque_limit_final_ = std::clamp(get_parameter("external_torque_limit_final").as_double(),
+                                             external_torque_limit_initial_, 1.0);
+    external_torque_rate_limit_norm_s_ = std::max(0.0, get_parameter("external_torque_rate_limit_norm_s").as_double());
+    external_safety_tilt_rad_ = std::clamp(get_parameter("external_safety_tilt_deg").as_double(), 5.0, 80.0) * M_PI / 180.0;
+    external_safety_rate_rad_s_ = std::max(0.1, get_parameter("external_safety_rate_rad_s").as_double());
     tau_axis_max_(0) = std::max(1e-6, get_parameter("tau_max_roll_nm").as_double());
     tau_axis_max_(1) = std::max(1e-6, get_parameter("tau_max_pitch_nm").as_double());
     tau_axis_max_(2) = std::max(1e-6, get_parameter("tau_max_yaw_nm").as_double());
@@ -250,6 +268,17 @@ void UAMAdaptiveController::odom_cb(const px4_msgs::msg::VehicleOdometry::Shared
     omega_(2) = msg->angular_velocity[2]; // Yaw speed
     altitude_m_ = -msg->position[2];
     vertical_speed_m_s_ = -msg->velocity[2];
+
+    const double qw = msg->q[0];
+    const double qx = msg->q[1];
+    const double qy = msg->q[2];
+    const double qz = msg->q[3];
+    const double sinr_cosp = 2.0 * (qw * qx + qy * qz);
+    const double cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy);
+    attitude_roll_rad_ = std::atan2(sinr_cosp, cosr_cosp);
+    const double sinp = 2.0 * (qw * qy - qz * qx);
+    attitude_pitch_rad_ = std::asin(std::clamp(sinp, -1.0, 1.0));
+
     last_odom_rx_time_ = get_clock()->now().seconds();
     has_odom_ = true;
 }
@@ -334,7 +363,38 @@ void UAMAdaptiveController::arm_wrench_cb(const geometry_msgs::msg::WrenchStampe
 
 
 void UAMAdaptiveController::enable_cb(const std_msgs::msg::Bool::SharedPtr msg) {
-    if (msg->data && !controller_enabled_) {
+    bool requested_enable = msg->data;
+
+    if (!requested_enable) {
+        external_handoff_fault_ = false;
+        warned_external_handoff_fault_ = false;
+        last_tau_norm_pub_.setZero();
+    }
+
+    if (requested_enable && !external_torque_output_allowed_) {
+        if (!warned_external_torque_blocked_) {
+            RCLCPP_WARN(
+                get_logger(),
+                "External torque handoff request ignored because allow_external_torque_output=false. "
+                "For the custom PX4 v1.16.2-rbfnn firmware this parameter should normally be true; "
+                "set it false only when intentionally running PX4 internal rate control for comparison.");
+            warned_external_torque_blocked_ = true;
+        }
+        requested_enable = false;
+    }
+
+    if (requested_enable && external_handoff_fault_) {
+        if (!warned_external_handoff_fault_) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "External torque handoff request ignored because a safety fault is latched. "
+                "Publish /uam/controller_enable=false or restart the controller before trying again.");
+            warned_external_handoff_fault_ = true;
+        }
+        requested_enable = false;
+    }
+
+    if (requested_enable && !controller_enabled_) {
         RCLCPP_INFO(get_logger(), "Rate Controller ENABLED. RBFNN ramp-up reset.");
         rbfnn_->reset();
         controller_start_time_ = -1.0; // Reset ramp timer cho flight session mới
@@ -347,7 +407,10 @@ void UAMAdaptiveController::enable_cb(const std_msgs::msg::Bool::SharedPtr msg) 
         tau_arm_virtual_disturbance_.setZero();
         tau_arm_virtual_disturbance_target_.setZero();
         arm_cg_bias_norm_.setZero();
-    } else if (!msg->data && controller_enabled_) {
+        last_tau_norm_pub_.setZero();
+        external_handoff_fault_ = false;
+        warned_external_handoff_fault_ = false;
+    } else if (!requested_enable && controller_enabled_) {
         RCLCPP_INFO(get_logger(), "Rate Controller DISABLED. PX4 internal rate controller fallback remains active.");
         rbfnn_->reset();
         controller_start_time_ = -1.0;
@@ -360,8 +423,9 @@ void UAMAdaptiveController::enable_cb(const std_msgs::msg::Bool::SharedPtr msg) 
         tau_arm_virtual_disturbance_.setZero();
         tau_arm_virtual_disturbance_target_.setZero();
         arm_cg_bias_norm_.setZero();
+        last_tau_norm_pub_.setZero();
     }
-    controller_enabled_ = msg->data;
+    controller_enabled_ = requested_enable && external_torque_output_allowed_;
 }
 
 bool UAMAdaptiveController::inputs_fresh(double now) const {
@@ -605,9 +669,25 @@ void UAMAdaptiveController::control_loop() {
         tau_norm(1) = tau(1) / tau_axis_max_(1);
         tau_norm(2) = tau(2) / tau_axis_max_(2);
         
-        // 4. Feedforward CG Offset Compensation (Cân bằng trọng lượng cánh tay tĩnh)
-        tau_norm(0) += base_roll_offset_ + arm_cg_bias_norm_(0);
-        tau_norm(1) += base_pitch_offset_ + arm_cg_bias_norm_(1);
+        const double handoff_ramp = std::clamp(elapsed / external_torque_ramp_s_, 0.0, 1.0);
+
+        // 4. Feedforward CG Offset Compensation. Keep static base offsets off by
+        // default because an incorrectly signed offset creates an immediate
+        // open-loop torque step at handoff.
+        if (base_offset_enabled_) {
+            tau_norm(0) += handoff_ramp * base_roll_offset_;
+            tau_norm(1) += handoff_ramp * base_pitch_offset_;
+        }
+
+        tau_norm(0) += handoff_ramp * arm_cg_bias_norm_(0);
+        tau_norm(1) += handoff_ramp * arm_cg_bias_norm_(1);
+
+        const double torque_limit = external_torque_limit_initial_
+            + handoff_ramp * (external_torque_limit_final_ - external_torque_limit_initial_);
+        tau_norm = sat_vec(tau_norm, Eigen::Vector3d::Constant(torque_limit));
+        tau_norm = rate_limit_vec(last_tau_norm_pub_, tau_norm,
+                                  external_torque_rate_limit_norm_s_ * dt);
+        last_tau_norm_pub_ = tau_norm;
         
         // ★ FIX #3: Thrust saturation để chống flyaway
         thrust_norm(0) = std::clamp(thrust_des_(0), -0.1, 0.1);
@@ -624,12 +704,36 @@ void UAMAdaptiveController::control_loop() {
                 "Check odometry/rate-setpoint/RNE freshness.");
         }
         n_hat_.setZero();
+        last_tau_norm_pub_.setZero();
         // Không nhận đủ điều kiện tính toán -> Lực = 0 để nuôi Control Allocator
     }
     
     // 4. Chỉ gửi lực đẩy và mô-men về cho PX4 khi controller_enabled_ = true
     // Khi controller_enabled_ = false, KHÔNG GỬI để PX4 tự động fallback về internal rate controller
     if (px4_timestamp_ == 0) return; 
+
+    if (controller_enabled_ && can_compute) {
+        const bool attitude_unsafe =
+            std::abs(attitude_roll_rad_) > external_safety_tilt_rad_
+            || std::abs(attitude_pitch_rad_) > external_safety_tilt_rad_;
+        const bool rate_unsafe =
+            omega_.cwiseAbs().maxCoeff() > external_safety_rate_rad_s_;
+
+        if (attitude_unsafe || rate_unsafe) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "External torque safety fault. roll=%.1f deg pitch=%.1f deg |omega|max=%.2f rad/s. "
+                "Stopping ROS torque publish; PX4 should fall back after MC_RATE_EXT_TMO.",
+                attitude_roll_rad_ * 180.0 / M_PI,
+                attitude_pitch_rad_ * 180.0 / M_PI,
+                omega_.cwiseAbs().maxCoeff());
+            external_handoff_fault_ = true;
+            warned_external_handoff_fault_ = true;
+            controller_enabled_ = false;
+            last_tau_norm_pub_.setZero();
+            return;
+        }
+    }
 
     if (controller_enabled_ && can_compute) {
         px4_msgs::msg::VehicleTorqueSetpoint torque_msg{};

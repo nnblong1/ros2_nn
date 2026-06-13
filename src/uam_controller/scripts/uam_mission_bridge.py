@@ -51,7 +51,13 @@ class UAMMissionBridge(Node):
         self.declare_parameter("loop_rate_hz", 20.0)
         self.declare_parameter("offboard_prime_duration_s", 3.0)
         self.declare_parameter("require_local_position_ready", True)
+        self.declare_parameter("require_heading_good_for_control", False)
         self.declare_parameter("auto_enable_external_controller", False)
+        self.declare_parameter("allow_external_torque_handoff", True)
+        self.declare_parameter("external_handoff_stable_time_s", 5.0)
+        self.declare_parameter("external_handoff_max_position_error_m", 0.30)
+        self.declare_parameter("external_handoff_max_horizontal_speed_ms", 0.20)
+        self.declare_parameter("external_handoff_max_vertical_speed_ms", 0.12)
 
         self.takeoff_height = self.get_parameter("takeoff_height").value
         self.cruise_speed   = self.get_parameter("cruise_speed").value
@@ -60,7 +66,25 @@ class UAMMissionBridge(Node):
         self.offboard_prime_duration_s = self.get_parameter("offboard_prime_duration_s").value
         self.offboard_prime_ticks = max(1, int(math.ceil(self.offboard_prime_duration_s * self.rate_hz)))
         self.require_local_position_ready = bool(self.get_parameter("require_local_position_ready").value)
+        self.require_heading_good_for_control = bool(
+            self.get_parameter("require_heading_good_for_control").value
+        )
         self.auto_enable_external_controller = bool(self.get_parameter("auto_enable_external_controller").value)
+        self.allow_external_torque_handoff = bool(
+            self.get_parameter("allow_external_torque_handoff").value
+        )
+        self.external_handoff_stable_time_s = float(
+            self.get_parameter("external_handoff_stable_time_s").value
+        )
+        self.external_handoff_max_position_error_m = float(
+            self.get_parameter("external_handoff_max_position_error_m").value
+        )
+        self.external_handoff_max_horizontal_speed_ms = float(
+            self.get_parameter("external_handoff_max_horizontal_speed_ms").value
+        )
+        self.external_handoff_max_vertical_speed_ms = float(
+            self.get_parameter("external_handoff_max_vertical_speed_ms").value
+        )
 
         qos_reliable = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -98,6 +122,7 @@ class UAMMissionBridge(Node):
 
         self.vehicle_status = VehicleStatus()
         self.current_pos    = np.zeros(3)  # NED
+        self.current_vel    = np.zeros(3)  # NED
         self.current_yaw    = 0.0
         
         self.setpoint       = np.zeros(3)
@@ -107,6 +132,13 @@ class UAMMissionBridge(Node):
         self.initialized    = False
         self.has_local_pos  = False
         self.local_position_ready = False
+        self.local_position_flags = {
+            "xy_valid": False,
+            "z_valid": False,
+            "v_xy_valid": False,
+            "v_z_valid": False,
+            "heading_good_for_control": False,
+        }
         self.px4_timestamp  = 0
         self.px4_timestamp_ros_us = 0
         self.offboard_counter = 0
@@ -114,6 +146,9 @@ class UAMMissionBridge(Node):
         self._takeoff_step = 0
         self._takeoff_timer = 0
         self._retry_timer = 0
+        self._external_handoff_block_warned = False
+        self._external_handoff_stable_since = 0.0
+        self._external_handoff_wait_logged = False
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self._control_loop)
         self.get_logger().info("✅ UAM Mission Bridge (PX4 Position Commander) sẵn sàng!")
@@ -121,6 +156,11 @@ class UAMMissionBridge(Node):
             f"   Offboard prime: {self.offboard_prime_duration_s:.2f}s "
             f"({self.offboard_prime_ticks} ticks @ {self.rate_hz:.1f} Hz)"
         )
+        if self.auto_enable_external_controller and not self.allow_external_torque_handoff:
+            self.get_logger().warn(
+                "auto_enable_external_controller=true nhưng allow_external_torque_handoff=false. "
+                "Mission bridge sẽ giữ /uam/controller_enable=false."
+            )
 
     def _cb_status(self, msg: VehicleStatus):
         if self.vehicle_status.nav_state != msg.nav_state or self.vehicle_status.arming_state != msg.arming_state:
@@ -132,6 +172,7 @@ class UAMMissionBridge(Node):
         if not self.has_local_pos:
             # Fallback NED từ Odometry nếu VehicleLocalPosition chưa sẵn sàng.
             self.current_pos = np.array([msg.position[0], msg.position[1], msg.position[2]])
+            self.current_vel = np.array([msg.velocity[0], msg.velocity[1], msg.velocity[2]])
             q = msg.q
             siny = 2.0 * (q[0] * q[3] + q[1] * q[2])
             cosy = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3])
@@ -141,14 +182,25 @@ class UAMMissionBridge(Node):
 
     def _cb_local_pos(self, msg: VehicleLocalPosition):
         self.current_pos = np.array([msg.x, msg.y, msg.z])
+        self.current_vel = np.array([msg.vx, msg.vy, msg.vz])
         self.current_yaw = msg.heading
         self.has_local_pos = True
+        self.local_position_flags = {
+            "xy_valid": bool(msg.xy_valid),
+            "z_valid": bool(msg.z_valid),
+            "v_xy_valid": bool(msg.v_xy_valid),
+            "v_z_valid": bool(msg.v_z_valid),
+            "heading_good_for_control": bool(msg.heading_good_for_control),
+        }
         self.local_position_ready = (
-            bool(msg.xy_valid)
-            and bool(msg.z_valid)
-            and bool(msg.v_xy_valid)
-            and bool(msg.v_z_valid)
-            and bool(msg.heading_good_for_control)
+            self.local_position_flags["xy_valid"]
+            and self.local_position_flags["z_valid"]
+            and self.local_position_flags["v_xy_valid"]
+            and self.local_position_flags["v_z_valid"]
+            and (
+                self.local_position_flags["heading_good_for_control"]
+                or not self.require_heading_good_for_control
+            )
         )
         self.initialized = True
         self._update_px4_timestamp(msg.timestamp)
@@ -193,10 +245,15 @@ class UAMMissionBridge(Node):
             return response
         if self.require_local_position_ready and not self.local_position_ready:
             response.success = False
+            flags = ", ".join(
+                f"{name}={str(value).lower()}"
+                for name, value in self.local_position_flags.items()
+            )
             response.message = (
                 "Local position/heading chưa sẵn sàng "
-                "(cần xy_valid, z_valid, v_xy_valid, v_z_valid, heading_good_for_control). "
-                "Không vào Offboard position takeoff."
+                "(cần xy_valid, z_valid, v_xy_valid, v_z_valid"
+                + (", heading_good_for_control" if self.require_heading_good_for_control else "")
+                + f"). Trạng thái hiện tại: {flags}. Không vào Offboard position takeoff."
             )
             return response
         if self.state != self.STATE_IDLE:
@@ -359,13 +416,15 @@ class UAMMissionBridge(Node):
                 self.state = self.STATE_HOLD
                 self._takeoff_step = 0
                 self._retry_timer = 0
+                self._external_handoff_stable_since = 0.0
+                self._external_handoff_wait_logged = False
 
         elif self.state == self.STATE_HOLD:
-            self._publish_enable(self.auto_enable_external_controller)
+            self._publish_enable(self._external_enable_allowed())
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
 
         elif self.state == self.STATE_GOTO:
-            self._publish_enable(self.auto_enable_external_controller)
+            self._publish_enable(self._external_enable_allowed())
             self._publish_setpoint(self.setpoint, self.setpoint_yaw)
             dist = np.linalg.norm(self.current_pos - self.setpoint)
             if dist < self.pos_threshold:
@@ -403,11 +462,9 @@ class UAMMissionBridge(Node):
         )
 
     def _publish_offboard_mode(self):
-        # ★ FIX #2 (Safety Doc): Trong Approach B, PHẢI giữ position=True.
-        # PX4 cần chạy Position → Attitude Controller để sinh VehicleRatesSetpoint.
-        # Node C++ (RBFNN) sẽ lấy RatesSetpoint đó và tính Torque trực tiếp.
-        # PX4 Rate Controller gains = 0 nên không xung đột.
-        # ⚠️ KHÔNG ĐƯỢC dùng direct_actuator=True, nó sẽ tắt pipeline rate setpoint!
+        # Approach B: keep position=True so PX4 position/attitude loops continue
+        # generating VehicleRatesSetpoint. The custom PX4 v1.16.2-rbfnn firmware
+        # lets ROS replace only mc_rate_control torque/thrust after handoff.
         msg = OffboardControlMode()
         msg.timestamp    = self._timestamp_us()
         msg.position     = True
@@ -430,6 +487,58 @@ class UAMMissionBridge(Node):
         msg = Bool()
         msg.data = enable
         self.pub_enable.publish(msg)
+
+    def _external_enable_allowed(self) -> bool:
+        if not self.auto_enable_external_controller:
+            return False
+        if self.allow_external_torque_handoff:
+            now = self.get_clock().now().nanoseconds / 1e9
+            position_error = float(np.linalg.norm(self.current_pos - self.setpoint))
+            horizontal_speed = float(np.linalg.norm(self.current_vel[:2]))
+            vertical_speed = abs(float(self.current_vel[2]))
+            stable = (
+                position_error <= self.external_handoff_max_position_error_m
+                and horizontal_speed <= self.external_handoff_max_horizontal_speed_ms
+                and vertical_speed <= self.external_handoff_max_vertical_speed_ms
+            )
+
+            if stable:
+                if self._external_handoff_stable_since <= 0.0:
+                    self._external_handoff_stable_since = now
+                    self._external_handoff_wait_logged = False
+
+                stable_duration = now - self._external_handoff_stable_since
+
+                if stable_duration >= self.external_handoff_stable_time_s:
+                    if not self._external_handoff_wait_logged:
+                        self.get_logger().info(
+                            "External torque handoff gate ready: "
+                            f"stable {stable_duration:.1f}s, pos_err={position_error:.2f}m, "
+                            f"v_xy={horizontal_speed:.2f}m/s, v_z={vertical_speed:.2f}m/s."
+                        )
+                        self._external_handoff_wait_logged = True
+                    return True
+
+                if not self._external_handoff_wait_logged:
+                    self.get_logger().info(
+                        "Đang chờ hover ổn định trước external handoff: "
+                        f"{stable_duration:.1f}/{self.external_handoff_stable_time_s:.1f}s."
+                    )
+                    self._external_handoff_wait_logged = True
+
+            else:
+                self._external_handoff_stable_since = 0.0
+                self._external_handoff_wait_logged = False
+
+            return False
+
+        if not self._external_handoff_block_warned:
+            self._external_handoff_block_warned = True
+            self.get_logger().warn(
+                "Chặn auto external torque handoff vì allow_external_torque_handoff=false. "
+                "Đặt true khi chạy firmware custom PX4 v1.16.2-rbfnn."
+            )
+        return False
 
     def _track_current_ground_setpoint(self):
         self.setpoint = self.current_pos.copy()
