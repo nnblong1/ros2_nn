@@ -33,6 +33,232 @@ Các thay đổi chính trong PX4:
 
 Airframe `4000_gz_x500_hop` mặc định đặt `MC_RATE_EXT_EN=1`. Điều này vẫn an toàn cho takeoff/hover nền vì firmware chỉ bypass khi torque external còn mới; nếu ROS chưa enable hoặc topic bị stale, PX4 tự fallback về PID rate controller nội bộ.
 
+Lưu ý phần cứng thật: `4000_gz_x500_hop` hiện nằm trong
+`ROMFS/px4fmu_common/init.d-posix/airframes`, chỉ dùng cho SITL/POSIX.
+Log trên board `PX4_FMU_V6C` sẽ không chạy airframe POSIX này. Nếu log phần cứng
+có `SYS_AUTOSTART=4001`, board đang dùng airframe hardware `4001_quad_x`
+generic, nên `MC_RATE_EXT_EN` giữ default `0` và các tham số riêng của airframe
+4000 không được nạp. Muốn dùng `SYS_AUTOSTART=4000` trên phần cứng, phải thêm
+airframe tương ứng vào `ROMFS/px4fmu_common/init.d/airframes`, thêm vào
+`CMakeLists.txt`, rebuild/flash firmware, rồi chọn airframe 4000 hoặc set
+`SYS_AUTOSTART=4000` và reboot. Nếu chỉ dùng QGC/import params, phải đảm bảo
+firmware đã có airframe 4000; nếu không, sau reboot PX4 sẽ không nạp đúng cấu
+hình airframe.
+
+### Đảm bảo firmware hardware có airframe 4000 trước khi QGC/import params
+
+QGC/import params chỉ ghi giá trị tham số vào flash của flight controller. Nó
+không thể thêm file airframe mới vào ROMFS của firmware. Vì vậy trước khi import
+file params có `SYS_AUTOSTART=4000`, firmware flash lên board phải chứa một file
+airframe hardware có tiền tố `4000_...`.
+
+Quy trình đúng cho board `PX4_FMU_V6C`:
+
+1. Trong source PX4, tạo airframe hardware mới trong:
+
+   ```bash
+   /home/wicom/PX4-Autopilot/ROMFS/px4fmu_common/init.d/airframes/4000_uam_hop
+   ```
+
+   File này phải bắt đầu bằng:
+
+   ```sh
+   #!/bin/sh
+   #
+   # @name UAM HOP Quad X
+   # @type Quadrotor x
+   # @class Copter
+   #
+
+   . ${R}etc/init.d/rc.mc_defaults
+
+   param set-default SYS_AUTOSTART 4000
+   ```
+
+   Sau đó copy các nhóm param cần cho phần cứng từ airframe SITL
+   `init.d-posix/airframes/4000_gz_x500_hop`: `CA_METHOD`, toàn bộ
+   `CA_ROTOR*`, `MC_RATE_EXT_EN`, `MC_RATE_EXT_TMO`, các gain `MC_*`,
+   `MPC_*`, `BAT1_N_CELLS`, và các tham số vehicle thật đã kiểm chứng.
+   Không copy các dòng chỉ dành cho SITL như `PX4_SIMULATOR`, `PX4_GZ_*`,
+   `SIM_GZ_*`, hoặc các circuit breaker `CBRK_*` nếu chưa có quyết định an
+   toàn rõ ràng cho bay thật.
+
+2. Thêm file mới vào:
+
+   ```bash
+   /home/wicom/PX4-Autopilot/ROMFS/px4fmu_common/init.d/airframes/CMakeLists.txt
+   ```
+
+   Trong nhóm `[4000, 4999] Quadrotor x`, thêm dòng:
+
+   ```cmake
+       4000_uam_hop
+   ```
+
+3. Rebuild và flash đúng target hardware:
+
+   ```bash
+   cd /home/wicom/PX4-Autopilot
+   make px4_fmu-v6c_default
+   ```
+
+   Sau đó flash firmware `.px4` sinh ra qua QGC, hoặc dùng workflow upload
+   phần cứng nếu board đang ở bootloader.
+
+4. Sau khi flash và reboot, kiểm tra trong QGC:
+
+   - Vào `Analyze Tools` -> `MAVLink Console`.
+   - Chạy `ls /etc/init.d/airframes` và xác nhận có file `4000_uam_hop`.
+   - Chạy `param show MC_RATE_EXT_TMO`. Nếu báo không có param, firmware đang
+     chạy chưa phải nhánh custom mới.
+   - Set hoặc import params với `SYS_AUTOSTART=4000`, `MC_RATE_EXT_EN=1`,
+     `MC_RATE_EXT_TMO=0.10`, rồi reboot.
+   - Sau reboot, kiểm tra lại:
+
+     ```sh
+     param show SYS_AUTOSTART
+     param show MC_RATE_EXT_EN
+     param show MC_RATE_EXT_TMO
+     param show CA_ROTOR0_PX
+     param show CA_ROTOR0_PY
+     ```
+
+     Kết quả đạt yêu cầu là `SYS_AUTOSTART=4000`, `MC_RATE_EXT_EN=1`,
+     `MC_RATE_EXT_TMO` tồn tại, và `CA_ROTOR*` không còn là geometry generic
+     của `4001_quad_x` như `PX=1`, `PY=1`.
+
+Nếu QGC import params thành công nhưng sau reboot `SYS_AUTOSTART=4001`, hoặc
+`MC_RATE_EXT_TMO` không tồn tại, thì lỗi nằm ở firmware/airframe chưa đúng chứ
+không phải ở file params. Phải sửa airframe trong PX4, build lại và flash lại
+trước khi bay.
+
+### Cập nhật firmware custom sau khi thêm `4000_uam_hop`
+
+Quy trình này dùng cho board thật `PX4_FMU_V6C` sau khi source PX4 đã có:
+
+- `ROMFS/px4fmu_common/init.d/airframes/4000_uam_hop`
+- entry `4000_uam_hop` trong
+  `ROMFS/px4fmu_common/init.d/airframes/CMakeLists.txt`
+
+1. Kiểm tra đang ở đúng nhánh custom:
+
+   ```bash
+   cd /home/wicom/PX4-Autopilot
+   git branch --show-current
+   git status --short ROMFS/px4fmu_common/init.d/airframes/4000_uam_hop \
+       ROMFS/px4fmu_common/init.d/airframes/CMakeLists.txt \
+       src/modules/mc_rate_control
+   ```
+
+   Nhánh cần là `px4-v1.16.2-rbfnn`. Nếu file `4000_uam_hop` đang là
+   untracked thì vẫn build được ở máy local, nhưng cần đưa file này vào git
+   trước khi chuyển source sang máy khác.
+
+2. Build firmware hardware:
+
+   ```bash
+   cd /home/wicom/PX4-Autopilot
+   make px4_fmu-v6c_default
+   ```
+
+   File cần flash sau khi build xong:
+
+   ```bash
+   /home/wicom/PX4-Autopilot/build/px4_fmu-v6c_default/px4_fmu-v6c_default.px4
+   ```
+
+3. Kiểm tra artifact build đã đóng gói airframe 4000:
+
+   ```bash
+   test -f build/px4_fmu-v6c_default/etc/init.d/airframes/4000_uam_hop
+   rg -n "SYS_AUTOSTART|MC_RATE_EXT_EN|MC_RATE_EXT_TMO" \
+       build/px4_fmu-v6c_default/etc/init.d/airframes/4000_uam_hop
+   ```
+
+   Kết quả phải có `SYS_AUTOSTART 4000`, `MC_RATE_EXT_EN 1`, và
+   `MC_RATE_EXT_TMO 0.10`.
+
+4. Flash bằng QGC:
+
+   - Tháo cánh.
+   - Cắm USB flight controller.
+   - Mở QGC -> `Vehicle Setup` -> `Firmware`.
+   - Chọn `Advanced settings` hoặc `Custom firmware file`.
+   - Chọn file:
+
+     ```text
+     /home/wicom/PX4-Autopilot/build/px4_fmu-v6c_default/px4_fmu-v6c_default.px4
+     ```
+
+   - Chờ flash xong và để board reboot.
+
+   Nếu dùng terminal thay QGC và board đang vào bootloader, có thể dùng:
+
+   ```bash
+   cd /home/wicom/PX4-Autopilot
+   make px4_fmu-v6c_default upload
+   ```
+
+5. Chọn airframe mới và bắt PX4 load default của airframe:
+
+   Trong QGC -> `Analyze Tools` -> `MAVLink Console`, chạy:
+
+   ```sh
+   param set SYS_AUTOSTART 4000
+   param set SYS_AUTOCONFIG 1
+   param save
+   reboot
+   ```
+
+   `SYS_AUTOCONFIG=1` là bước quan trọng khi đổi từ `4001_quad_x` sang
+   `4000_uam_hop`: PX4 sẽ reset các param không thuộc nhóm calibration/RC
+   được giữ lại, rồi nạp default từ file airframe mới ở lần boot kế tiếp.
+   Trước khi làm bước này nên export params hiện tại từ QGC để có bản backup.
+
+6. Sau reboot, kiểm tra airframe và param:
+
+   Trong QGC `MAVLink Console`:
+
+   ```sh
+   ls /etc/init.d/airframes
+   param show SYS_AUTOSTART
+   param show SYS_AUTOCONFIG
+   param show MC_RATE_EXT_EN
+   param show MC_RATE_EXT_TMO
+   param show CA_ROTOR0_PX
+   param show CA_ROTOR0_PY
+   param show CA_ROTOR1_PX
+   param show CA_ROTOR1_PY
+   ```
+
+   Kết quả đạt yêu cầu:
+
+   - Danh sách airframe có `4000_uam_hop`.
+   - `SYS_AUTOSTART=4000`.
+   - `SYS_AUTOCONFIG=0` sau khi quá trình reset/reboot đã hoàn tất.
+   - `MC_RATE_EXT_EN=1`.
+   - `MC_RATE_EXT_TMO=0.10`.
+   - `CA_ROTOR0_PX=-0.159`, `CA_ROTOR0_PY=-0.159`,
+     `CA_ROTOR1_PX=0.159`, `CA_ROTOR1_PY=0.159`.
+
+7. Kiểm tra bắt buộc trước khi lắp cánh:
+
+   - QGC `Actuator Test`: xác nhận motor 0-3 đúng vị trí và đúng chiều quay
+     như comment trong `4000_uam_hop`.
+   - QGC `Sensors`: calibration vẫn hợp lệ sau flash.
+   - QGC `Parameters`: các serial/RC/failsafe/power/battery params thực tế
+     vẫn đúng với wiring của vehicle.
+   - MAVLink Console: `param show MC_RATE_EXT_TMO` không báo missing.
+
+Chỉ bay test sau khi các kiểm tra trên đạt. Nếu sau flash vẫn thấy
+`SYS_AUTOSTART=4001`, hoặc `MC_RATE_EXT_TMO` missing, thì board chưa chạy đúng
+firmware custom mới.
+
+Nếu `MC_RATE_EXT_TMO` không xuất hiện trong ULog, binary đang bay chưa chứa
+định nghĩa param này. Source hiện tại định nghĩa `MC_RATE_EXT_TMO` trong
+`src/modules/mc_rate_control/mc_rate_control_params.c`; vì vậy cần build/flash
+lại đúng nhánh PX4 trước khi đánh giá log mới.
+
 Lưu ý quan trọng về submodule Gazebo: nếu `git -C Tools/simulation/gz rev-parse
 --short HEAD` trả về `e05f4312d3`, đó là commit official và sẽ không có
 `models/x500_hop`. Phải checkout lại commit custom `e7675e2318` trước khi chạy
@@ -52,12 +278,22 @@ Mặc định:
 - `allow_external_torque_handoff:=true`
 - `external_handoff_mode:=manual`
 - ROS chỉ publish torque/thrust sau khi stable hover gate sẵn sàng và có lệnh enable.
+- `/uam/enable_external_controller` chỉ bật cờ ROS `/uam/controller_enable`.
+  Service này không set PX4 param `MC_RATE_EXT_EN`, không set `SYS_AUTOSTART`,
+  và không tự chuyển PX4 sang Offboard/External nav mode.
+- `qgc_rbfnn_trigger.py` chặn handoff nếu PX4 còn ở `STAB`. Mặc định chỉ cho
+  phép `OFFBOARD`, `POSCTL`, `AUTO_LOITER`, hoặc `AUTO_TAKEOFF`; có thể đổi
+  bằng launch arg `required_nav_states`.
 
 Bật handoff thủ công sau khi QGC đã takeoff và hover ổn định:
 
 ```bash
 ros2 service call /uam/enable_external_controller std_srvs/srv/Trigger {}
 ```
+
+Trước khi gọi service này, kiểm tra QGC/PX4 đang ở `POSCTL`, `AUTO_LOITER`
+hoặc `OFFBOARD`. Nếu còn `STAB`, service phải bị từ chối và không được publish
+external torque.
 
 Tắt handoff để quay về fallback PX4 internal rate PID:
 
@@ -90,6 +326,8 @@ Các nguyên nhân chính đã được khóa lại trong ROS controller:
 - Nếu roll/pitch vượt `external_safety_tilt_deg` hoặc body-rate vượt
   `external_safety_rate_rad_s`, node dừng publish torque để PX4 fallback về PID
   rate controller nội bộ sau `MC_RATE_EXT_TMO`.
+- Với QGC workflow, trigger không cho bật external torque trong `STAB`; phải
+  chuyển sang mode có position/hold/offboard trước khi handoff.
 
 Các tham số an toàn mặc định:
 
@@ -473,7 +711,13 @@ Khuyến nghị cho lần bay thật đầu tiên:
 External torque path chỉ thật sự điều khiển motor khi đồng thời thỏa:
 
 - PX4 đang chạy nhánh `px4-v1.16.2-rbfnn`.
-- Airframe `gz_x500_hop` hoặc PX4 param `MC_RATE_EXT_EN=1`.
+- Airframe đúng đã được nạp. SITL dùng `SYS_AUTOSTART=4000`
+  (`4000_gz_x500_hop`). Phần cứng thật phải có airframe hardware 4000 tương
+  ứng hoặc set tay toàn bộ param cần thiết.
+- PX4 param `MC_RATE_EXT_EN=1`.
+- PX4 firmware/log có `MC_RATE_EXT_TMO`.
+- PX4 nav mode không phải `STAB`; với QGC trigger mặc định cần `OFFBOARD`,
+  `POSCTL`, `AUTO_LOITER`, hoặc `AUTO_TAKEOFF`.
 - ROS nhận được `/fmu/out/vehicle_rates_setpoint`.
 - `/uam/controller_enable=true`.
 - ROS publish torque/thrust mới hơn `MC_RATE_EXT_TMO`.

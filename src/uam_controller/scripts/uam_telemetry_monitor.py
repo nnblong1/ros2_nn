@@ -123,11 +123,19 @@ class UAMTelemetryMonitor(Node):
 
         nav_state_map = {
             VehicleStatus.NAVIGATION_STATE_MANUAL:   "MANUAL",
+            VehicleStatus.NAVIGATION_STATE_ALTCTL:   "ALTCTL",
+            VehicleStatus.NAVIGATION_STATE_POSCTL:   "POSCTL",
             VehicleStatus.NAVIGATION_STATE_OFFBOARD: "OFFBOARD",
             VehicleStatus.NAVIGATION_STATE_AUTO_LOITER: "LOITER",
             VehicleStatus.NAVIGATION_STATE_AUTO_RTL:    "RTL",
             VehicleStatus.NAVIGATION_STATE_AUTO_LAND:   "LAND",
+            VehicleStatus.NAVIGATION_STATE_AUTO_TAKEOFF: "TAKEOFF",
+            VehicleStatus.NAVIGATION_STATE_STAB: "STAB",
         }
+        for idx in range(1, 9):
+            name = f"NAVIGATION_STATE_EXTERNAL{idx}"
+            if hasattr(VehicleStatus, name):
+                nav_state_map[getattr(VehicleStatus, name)] = f"EXTERNAL{idx}"
         nav_str = nav_state_map.get(self.status.nav_state, "OTHER")
 
         data = {

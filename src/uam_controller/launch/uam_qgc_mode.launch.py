@@ -23,6 +23,8 @@ CHẾ ĐỘ BAY:
       sau hover ổn định, gọi /uam/enable_external_controller để bắt đầu bypass.
   - external_handoff_mode:=auto:
       tự bật bypass sau hover ổn định.
+  - qgc_rbfnn_trigger chỉ cho bật handoff khi PX4 đang ở mode được phép
+    (mặc định OFFBOARD/POSCTL/AUTO_LOITER/AUTO_TAKEOFF). STAB bị chặn.
 
 Cách dùng:
   # Gazebo SITL
@@ -113,6 +115,12 @@ def generate_launch_description():
         description='true = cho phép ROS publish torque/thrust khi trigger enable; false = chỉ monitor/log.'
     )
 
+    arg_required_nav_states = DeclareLaunchArgument(
+        'required_nav_states',
+        default_value='OFFBOARD,POSCTL,AUTO_LOITER,AUTO_TAKEOFF',
+        description='Danh sách nav_state PX4 được phép handoff external torque. Không nên thêm STAB.'
+    )
+
     arg_rbfnn_output_enable = DeclareLaunchArgument(
         'rbfnn_output_enable',
         default_value='true',
@@ -190,6 +198,7 @@ def generate_launch_description():
     enable_rbfnn = LaunchConfiguration('enable_rbfnn')
     handoff_mode = LaunchConfiguration('external_handoff_mode')
     allow_external_torque_handoff = LaunchConfiguration('allow_external_torque_handoff')
+    required_nav_states = LaunchConfiguration('required_nav_states')
     rbfnn_output_enable = LaunchConfiguration('rbfnn_output_enable')
     arm_ff_enable = LaunchConfiguration('arm_ff_enable')
     arm_virtual_disturbance_enable = LaunchConfiguration('arm_virtual_disturbance_enable')
@@ -382,6 +391,7 @@ def generate_launch_description():
                 allow_external_torque_handoff,
                 value_type=bool,
             ),
+            'required_nav_states': required_nav_states,
         }],
         condition=IfCondition(enable_rbfnn)
     )
@@ -411,6 +421,7 @@ def generate_launch_description():
             '║  Firmware: px4-v1.16.2-rbfnn, MC_RATE_EXT_EN=1           ║\n'
             '║  ROS chỉ publish torque sau khi trigger hover bật enable. ║\n'
             '║  Manual: gọi /uam/enable_external_controller sau hover.   ║\n'
+            '║  STAB bị chặn; dùng POSCTL/HOLD/OFFBOARD trước handoff.   ║\n'
             '╚══════════════════════════════════════════════════════════╝'
         )
     )
@@ -442,6 +453,7 @@ def generate_launch_description():
         arg_rbfnn,
         arg_handoff_mode,
         arg_allow_external_torque_handoff,
+        arg_required_nav_states,
         arg_rbfnn_output_enable,
         arg_arm_ff_enable,
         arg_arm_virtual_disturbance_enable,
